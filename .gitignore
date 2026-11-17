@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Captures and packet logs written by the monitor
+logs/
+*.iq

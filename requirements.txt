@@ -1,0 +1,4 @@
+numpy>=2.3
+scipy>=1.16
+pyqtgraph>=0.14
+PyQt6
