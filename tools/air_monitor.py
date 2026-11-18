@@ -1,25 +1,26 @@
 """Air monitor: watch the 2440 MHz LoRa link over the air with the HackRF Pro, in a window.
 
 It shows, live:
-  - the spectrum and waterfall around 2440 MHz (the LoRa channel is shaded),
+  - whether the link is working, in plain words, and what to do when it is not,
+  - the waterfall around 2440 MHz (the LoRa channel is marked, and every packet heard),
   - a timeline of the channel power over the last 2 s (every packet is a burst; TDMA slots line up),
-  - every burst it hears, decoded with lora_phy: payload text and hex, CRC, level, SNR, frequency error,
-    duration and the time since the previous packet.
+  - every burst it hears, decoded with lora_phy: payload text, and under "Show details" hex, CRC, level, SNR,
+    frequency error, duration and the time since the previous packet, plus the spectrum and raw gains.
 
 Radio settings match the v0.1 nodes: 2440.0 MHz, LoRa SF7, BW 1625 kHz, CR 4/5, sync word 0x12.
 The HackRF is tuned 1.5 MHz below the channel (2438.5 MHz) so its own DC spike stays out of the LoRa band.
 
     python3 tools/air_monitor.py                      # live from the HackRF
+    python3 tools/air_monitor.py --demo               # an example recording, no HackRF needed
     python3 tools/air_monitor.py --lna 16 --vga 20    # start with other gains
-    python3 tools/air_monitor.py --file CAP.iq        # replay a capture made with the Record button
+    python3 tools/air_monitor.py --file CAP.iq        # replay a capture made with "Record raw radio data"
 
 The HackRF only receives here. Keep it at least 1 m from a node that is transmitting, RF amp off, and close
 Gqrx first (only one program can use the HackRF at a time). Packets go to logs/air_<time>.csv.
+This file is the receiver (DSP); the window is air_monitor_ui.py.
 """
 import argparse
 import collections
-import csv
-import datetime
 import multiprocessing as mp
 import os
 import queue
@@ -365,11 +366,13 @@ def _stop_requested(ctl_q):
         return False
 
 
-def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime):
+def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime, loop=False, demo=False):
     """Runs in its own process, so the window never slows the receiver down.
     A reader thread pulls IQ from hackrf_transfer (or a file) into a 2 s buffer and records it if asked; the
     main loop runs the Receiver. If the buffer ever overflows, whole blocks are dropped, counted and shown,
-    and the Receiver is told about the gap so packet timing stays right."""
+    and the Receiver is told about the gap so packet timing stays right.
+    demo: replay the synthetic capture from demo_capture.py (made here on first use, so the window stays live),
+    looping. loop: start a file again at its end."""
     blocks = queue.Queue(maxsize=40)
     stop = threading.Event()
     rec_lock = threading.Lock()
@@ -377,6 +380,10 @@ def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime):
     err_lines = collections.deque(maxlen=5)
     proc = None
     try:
+        if demo:
+            out_q.put(("status", "Preparing the demo…"))
+            import demo_capture
+            file, file_fc, loop = demo_capture.ensure(), FC, True
         if file:
             src = open(file, "rb")
             out_q.put(("status", f"Replaying {os.path.basename(file)}"))
@@ -402,6 +409,9 @@ def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime):
             idx = 0
             while not stop.is_set():
                 raw = _read_exact(src, 2 * BLOCK)
+                if raw is None and loop and idx > 0:
+                    src.seek(0)                           # the stream time keeps counting: no gap, no jump
+                    continue
                 if raw is None:
                     blocks.put(None)
                     return
@@ -447,7 +457,7 @@ def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime):
                 continue
             if item is None:
                 if file:
-                    out_q.put(("status", "Replay finished"))
+                    out_q.put(("done", "Replay finished"))
                 else:
                     time.sleep(0.2)
                     out_q.put(("error", " | ".join(l for l in err_lines if l) or "hackrf_transfer stopped"))
@@ -490,10 +500,11 @@ def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime):
 class Worker:
     """Starts and stops the DSP process. Results arrive on the queue passed in."""
 
-    def __init__(self, q, lna, vga, file=None, file_fc=FC, realtime=True):
+    def __init__(self, q, lna, vga, file=None, file_fc=FC, realtime=True, loop=False, demo=False):
         self.q = q
         self.ctl = mp.Queue()
-        self.p = mp.Process(target=dsp_main, args=(q, self.ctl, lna, vga, file, file_fc, realtime), daemon=True)
+        self.p = mp.Process(target=dsp_main, args=(q, self.ctl, lna, vga, file, file_fc, realtime, loop, demo),
+                            daemon=True)
 
     def start(self):
         self.p.start()
@@ -522,359 +533,27 @@ class Worker:
 
 # --------------------------------------------------------------------------------------------- GUI
 def run_gui(args):
-    import pyqtgraph as pg
-    from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-
-    pg.setConfigOptions(antialias=False)
-    KIND = {"ok": ("LoRa OK", "#2e9d4f"), "bad": ("LoRa error", "#d9534f"), "other": ("Other burst", "#8a8a8a")}
-    LNA_STEPS = [0, 8, 16, 24, 32, 40]
-
-    class Tile(QtWidgets.QFrame):
-        def __init__(self, title):
-            super().__init__()
-            self.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
-            lay = QtWidgets.QVBoxLayout(self)
-            lay.setContentsMargins(8, 4, 8, 4)
-            t = QtWidgets.QLabel(title)
-            t.setStyleSheet("color: palette(mid); font-size: 11px;")
-            self.v = QtWidgets.QLabel("–")
-            f = self.v.font()
-            f.setPointSize(f.pointSize() + 7)
-            f.setBold(True)
-            self.v.setFont(f)
-            lay.addWidget(t)
-            lay.addWidget(self.v)
-
-        def set(self, text, color=None):
-            self.v.setText(text)
-            self.v.setStyleSheet(f"color: {color};" if color else "")
-
-    class Main(QtWidgets.QMainWindow):
-        def __init__(self):
-            super().__init__()
-            self.setWindowTitle("Air Monitor: 2440 MHz LoRa (HackRF Pro)")
-            self.resize(1300, 950)
-            self.q = mp.Queue(maxsize=400)
-            self.worker = None
-            self.csv = None
-            self.reset_stats()
-
-            central = QtWidgets.QWidget()
-            self.setCentralWidget(central)
-            root = QtWidgets.QVBoxLayout(central)
-
-            # controls
-            bar = QtWidgets.QHBoxLayout()
-            self.btn = QtWidgets.QPushButton("Start")
-            self.btn.setMinimumWidth(90)
-            self.btn.clicked.connect(self.toggle)
-            self.lna = QtWidgets.QComboBox()
-            self.lna.addItems([str(v) for v in LNA_STEPS])
-            self.lna.setCurrentText(str(args.lna))
-            self.vga = QtWidgets.QSpinBox()
-            self.vga.setRange(0, 62)
-            self.vga.setSingleStep(2)
-            self.vga.setValue(args.vga)
-            self.lna.currentTextChanged.connect(self.gain_changed)
-            self.vga.valueChanged.connect(self.gain_changed)
-            self.rec = QtWidgets.QCheckBox("Record IQ (13 MB/s)")
-            self.rec.toggled.connect(self.record_toggled)
-            clear = QtWidgets.QPushButton("Clear")
-            clear.clicked.connect(self.clear)
-            self.status = QtWidgets.QLabel("Stopped")
-            self.health = QtWidgets.QLabel("")
-            self.resize_due = False
-            for w in (self.btn, QtWidgets.QLabel("LNA dB"), self.lna, QtWidgets.QLabel("VGA dB"), self.vga,
-                      self.rec, clear):
-                bar.addWidget(w)
-            bar.addWidget(self.status, 1)
-            bar.addWidget(self.health)
-            if args.file:
-                for w in (self.lna, self.vga, self.rec):
-                    w.setEnabled(False)
-            root.addLayout(bar)
-
-            # tiles
-            grid = QtWidgets.QGridLayout()
-            names = ["LoRa packets OK", "LoRa errors", "Other bursts", "OK packets / s (5 s)",
-                     "Interval (last)", "Level", "SNR", "Freq error"]
-            self.tiles = {}
-            for i, n in enumerate(names):
-                self.tiles[n] = Tile(n)
-                grid.addWidget(self.tiles[n], 0, i)
-            root.addLayout(grid)
-
-            split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-            root.addWidget(split, 1)
-            f_mhz = (FC + (np.arange(NFFT) - NFFT // 2) * FS / NFFT) / 1e6
-            self.f_mhz = f_mhz
-            lo_ch, hi_ch = (CH - BW / 2) / 1e6, (CH + BW / 2) / 1e6
-
-            # spectrum
-            self.spec = pg.PlotWidget(title="Spectrum (dBFS): live and peak hold")
-            self.spec.setLabel("bottom", "MHz")
-            self.spec.showGrid(x=True, y=True, alpha=0.25)
-            self.spec.setYRange(-110, -10)
-            self.spec.setXRange(f_mhz[0], f_mhz[-1], padding=0)
-            self.spec.addItem(pg.LinearRegionItem((lo_ch, hi_ch), movable=False,
-                                                  brush=pg.mkBrush(46, 157, 79, 40)))
-            self.c_max = self.spec.plot(pen=pg.mkPen("#e0a030", width=1))
-            self.c_mean = self.spec.plot(pen=pg.mkPen("#3a8fd8", width=1))
-            self.peak = None
-            split.addWidget(self.spec)
-
-            # waterfall
-            self.wf_rows = 200
-            self.wf = np.full((self.wf_rows, NFFT), -110.0, np.float32)
-            wfw = pg.PlotWidget(title="Waterfall (peak per 50 ms, newest at top, 10 s)")
-            wfw.setLabel("bottom", "MHz")
-            wfw.hideAxis("left")
-            self.img = pg.ImageItem()
-            self.img.setColorMap(pg.colormap.get("viridis"))
-            self.wf_rect = QtCore.QRectF(f_mhz[0], 0, f_mhz[-1] - f_mhz[0], self.wf_rows)
-            wfw.addItem(self.img)
-            wfw.setXLink(self.spec)
-            split.addWidget(wfw)
-
-            # timeline
-            self.tl = pg.PlotWidget(title="Channel power, last 2 s (each packet is a burst; "
-                                          "green = decoded, red = LoRa error, grey = other)")
-            self.tl.setLabel("bottom", "seconds before now")
-            self.tl.setLabel("left", "dBFS")
-            self.tl.showGrid(x=True, y=True, alpha=0.25)
-            self.tl.setXRange(-2, 0)
-            self.tl.setYRange(-90, -10)
-            self.c_tl = self.tl.plot(pen=pg.mkPen("#3a8fd8", width=1))
-            self.thr_line = pg.InfiniteLine(angle=0, pen=pg.mkPen("#e0a030", style=QtCore.Qt.PenStyle.DashLine))
-            self.tl.addItem(self.thr_line)
-            self.marks = pg.ScatterPlotItem(size=9, pen=None)
-            self.tl.addItem(self.marks)
-            self.tl_t = collections.deque()
-            self.tl_db = collections.deque()
-            self.now = 0.0
-            split.addWidget(self.tl)
-
-            # packet table
-            cols = ["Time", "Type", "Δt ms", "Len", "CRC", "Level dBFS", "SNR dB", "Freq err kHz",
-                    "Dur ms", "Text", "Hex"]
-            self.table = QtWidgets.QTableWidget(0, len(cols))
-            self.table.setHorizontalHeaderLabels(cols)
-            self.table.verticalHeader().setVisible(False)
-            self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-            self.table.horizontalHeader().setStretchLastSection(True)
-            mono = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
-            self.table.setFont(mono)
-            split.addWidget(self.table)
-            split.setSizes([200, 220, 200, 330])
-
-            self.timer = QtCore.QTimer(self)
-            self.timer.timeout.connect(self.poll)
-            self.timer.start(50)
-            if args.file or args.autostart:
-                QtCore.QTimer.singleShot(200, self.toggle)
-
-        # ----- state
-        def reset_stats(self):
-            self.count = {"ok": 0, "bad": 0, "other": 0}
-            self.ok_times = collections.deque()
-
-        def clear(self):
-            self.reset_stats()
-            self.table.setRowCount(0)
-            self.peak = None
-            self.marks.clear()
-            self.mark_pts = []
-            for t in self.tiles.values():
-                t.set("–")
-
-        def toggle(self):
-            if self.worker:
-                self.stop()
-            else:
-                self.start()
-
-        def start(self):
-            self.rec.setChecked(False)
-            self.q = mp.Queue(maxsize=400)                # fresh queue per run
-            self.worker = Worker(self.q, int(self.lna.currentText()), self.vga.value(), file=args.file,
-                                 file_fc=args.file_fc * 1e6, realtime=not args.fast)
-            self.worker.start()
-            self.btn.setText("Stop")
-            self.mark_pts = []
-            self.tl_t.clear()
-            self.tl_db.clear()
-            if self.csv is None:
-                os.makedirs(LOGS, exist_ok=True)
-                path = os.path.join(LOGS, f"air_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv")
-                self.csv_f = open(path, "w", newline="", buffering=1)
-                self.csv = csv.writer(self.csv_f)
-                self.csv.writerow(["time", "stream_s", "type", "dt_ms", "dur_ms", "level_dbfs", "snr_db",
-                                   "freq_err_khz", "len", "header_ok", "crc_ok", "sync", "payload_hex", "text"])
-                self.csv_path = path
-
-        def stop(self):
-            if self.worker:
-                self.worker.stop()
-                self.worker = None
-            self.btn.setText("Start")
-            self.status.setText("Stopped")
-
-        def gain_changed(self, *_):
-            if self.worker and not args.file:
-                self.stop()
-                self.start()
-
-        def record_toggled(self, on):
-            if not self.worker:
-                if on:
-                    self.rec.setChecked(False)
-                return
-            if on:
-                os.makedirs(LOGS, exist_ok=True)
-                path = os.path.join(LOGS, f"capture_{datetime.datetime.now():%Y%m%d_%H%M%S}"
-                                          f"_{FC / 1e6:.1f}MHz_{FS / 1e6:.1f}Msps.iq")
-                self.worker.set_record(path)
-                self.status.setText(f"Recording to {path}")
-            else:
-                self.worker.set_record(None)
-
-        def closeEvent(self, e):
-            self.stop()
-            super().closeEvent(e)
-
-        # ----- updates
-        def poll(self):
-            last = None
-            n = 0
-            while n < 100:
-                try:
-                    kind, val = self.q.get_nowait()
-                except queue.Empty:
-                    break
-                n += 1
-                if kind == "data":
-                    self.take(val)
-                    last = val
-                elif kind == "status":
-                    self.status.setText(val)
-                elif kind == "error":
-                    self.stop()
-                    self.status.setText("HackRF error: " + val)
-                    self.status.setStyleSheet("color: #d9534f;")
-            if last is None:
-                return
-            if "spec_mean" in last:
-                self.c_mean.setData(self.f_mhz, last["spec_mean"])
-                self.c_max.setData(self.f_mhz, self.peak)
-                lo = float(np.median(last["spec_mean"]))
-                self.img.setImage(self.wf[::-1].T, autoLevels=False, levels=(lo - 3, lo + 45))
-                self.img.setRect(self.wf_rect)            # after setImage: the rect scales the image's pixels
-            if self.tl_t:
-                t = np.fromiter(self.tl_t, float) - self.now
-                d = np.fromiter(self.tl_db, float)
-                m = len(t) // 4 * 4
-                if m:
-                    self.c_tl.setData(t[:m].reshape(-1, 4)[:, 0], d[:m].reshape(-1, 4).max(axis=1))
-                self.thr_line.setValue(last["thr_db"])
-                self.mark_pts = [p for p in self.mark_pts if p[0] > self.now - 2.2]
-                self.marks.setData([p[0] - self.now for p in self.mark_pts], [p[1] for p in self.mark_pts],
-                                   brush=[pg.mkBrush(KIND[p[2]][1]) for p in self.mark_pts])
-            self.update_tiles()
-            if self.resize_due and time.time() - getattr(self, "last_resize", 0) > 1:
-                self.table.resizeColumnsToContents()
-                self.resize_due, self.last_resize = False, time.time()
-
-        def take(self, out):
-            if "spec_mean" in out:
-                self.wf = np.roll(self.wf, 1, axis=0)
-                self.wf[0] = out["spec_max"]
-                self.peak = out["spec_max"] if self.peak is None else np.maximum(self.peak, out["spec_max"])
-            if "blk_t" in out:
-                self.tl_t.extend(out["blk_t"])
-                self.tl_db.extend(out["blk_db"])
-                self.now = out["now"]
-                while self.tl_t and self.tl_t[0] < self.now - 2.0:
-                    self.tl_t.popleft()
-                    self.tl_db.popleft()
-            for pk in out["packets"]:
-                self.add_packet(pk)
-            if "rate" in out:
-                bad = out["dropped"] > 0 or out["rate"] < FS * 0.995
-                self.health.setText(f"in {out['rate'] / 1e6:.3f} MS/s | dropped blocks {out['dropped']} | "
-                                    f"backlog {out['backlog'] * 50} ms")
-                self.health.setStyleSheet("color: #d9534f;" if bad else "")
-
-        def add_packet(self, pk):
-            self.count[pk["kind"]] += 1
-            if pk["kind"] == "ok":
-                self.ok_times.append(pk["stream_s"])
-            self.mark_pts.append((pk["stream_s"], pk["level_db"], pk["kind"]))
-            if pk["kind"] != "other":
-                self.last_pk = pk
-            text = "".join(chr(b) if 32 <= b < 127 else "." for b in pk["data"])
-            hexs = pk["data"].hex(" ")
-            fmt = lambda v, f: "" if v is None else format(v, f)                       # noqa: E731
-            crc = "" if pk["crc_ok"] is None else ("ok" if pk["crc_ok"] and pk["header_ok"] else "BAD")
-            row = [datetime.datetime.fromtimestamp(pk["wall"]).strftime("%H:%M:%S.%f")[:-3],
-                   KIND[pk["kind"]][0], fmt(pk["dt_ms"], ".1f"), fmt(pk["length"], "d"), crc,
-                   f"{pk['level_db']:.1f}", f"{pk['snr_db']:.1f}", fmt(pk["cfo_khz"], "+.1f"),
-                   fmt(pk["dur_ms"], ".2f"), text, hexs]
-            if pk["kind"] != "other" or args.show_other:
-                self.table.insertRow(0)
-                for i, v in enumerate(row):
-                    it = QtWidgets.QTableWidgetItem(v)
-                    if i == 1:
-                        it.setForeground(QtGui.QColor(KIND[pk["kind"]][1]))
-                    self.table.setItem(0, i, it)
-                if self.table.rowCount() > 500:
-                    self.table.removeRow(500)
-                self.resize_due = True
-            if self.csv:
-                self.csv.writerow([datetime.datetime.fromtimestamp(pk["wall"]).isoformat(timespec="milliseconds"),
-                                   f"{pk['stream_s']:.6f}", pk["kind"], fmt(pk["dt_ms"], ".3f"),
-                                   fmt(pk["dur_ms"], ".3f"), f"{pk['level_db']:.1f}", f"{pk['snr_db']:.1f}",
-                                   fmt(pk["cfo_khz"], ".2f"), fmt(pk["length"], "d"), pk["header_ok"],
-                                   pk["crc_ok"], pk["sync"], pk["data"].hex(), text])
-
-        def update_tiles(self):
-            T = self.tiles
-            T["LoRa packets OK"].set(str(self.count["ok"]), KIND["ok"][1] if self.count["ok"] else None)
-            T["LoRa errors"].set(str(self.count["bad"]), KIND["bad"][1] if self.count["bad"] else None)
-            T["Other bursts"].set(str(self.count["other"]))
-            while self.ok_times and self.ok_times[0] < self.now - 5:
-                self.ok_times.popleft()
-            T["OK packets / s (5 s)"].set(f"{len(self.ok_times) / 5:.1f}")
-            pk = getattr(self, "last_pk", None)
-            if pk:
-                T["Interval (last)"].set("–" if pk["dt_ms"] is None else f"{pk['dt_ms']:.1f} ms")
-                T["Level"].set(f"{pk['level_db']:.1f} dBFS",
-                               "#d9534f" if pk["level_db"] > -12 else None)   # near clipping: lower the gain
-                T["SNR"].set(f"{pk['snr_db']:.1f} dB")
-                T["Freq error"].set("–" if pk["cfo_khz"] is None else f"{pk['cfo_khz']:+.1f} kHz")
-
-    app = QtWidgets.QApplication(sys.argv)
-    w = Main()
-    w.show()
-    if args.screenshot:                                   # for testing: save the window after N seconds, quit
-        def snap():
-            w.grab().save(args.screenshot)
-            w.stop()
-            app.quit()
-        QtCore.QTimer.singleShot(int(args.screenshot_after * 1000), snap)
-    sys.exit(app.exec())
+    import air_monitor_ui                                # Qt is imported only here, never in the DSP process
+    air_monitor_ui.run(args)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--lna", type=int, default=16, choices=[0, 8, 16, 24, 32, 40], help="HackRF LNA gain dB")
-    ap.add_argument("--vga", type=int, default=20, help="HackRF VGA gain dB (0-62, even)")
+    ap.add_argument("--demo", action="store_true", help="play a built-in example recording (no HackRF needed)")
     ap.add_argument("--file", help="replay an int8 IQ capture (6.5 MS/s) instead of the HackRF")
     ap.add_argument("--file-fc", type=float, default=FC / 1e6, help="centre frequency of --file in MHz")
     ap.add_argument("--fast", action="store_true", help="replay --file as fast as possible")
+    ap.add_argument("--lna", type=int, choices=[0, 8, 16, 24, 32, 40],
+                    help="HackRF LNA gain dB (default: the last sensitivity used, Normal = 16)")
+    ap.add_argument("--vga", type=int, help="HackRF VGA gain dB, 0-62, even (default: last used, Normal = 20)")
+    ap.add_argument("--details", action=argparse.BooleanOptionalAction,
+                    help="open with the expert details shown (or hidden); default: as last time")
     ap.add_argument("--show-other", action="store_true", help="also list non-LoRa bursts (Wi-Fi etc.) in the table")
     ap.add_argument("--autostart", action="store_true", help="start receiving at once")
     ap.add_argument("--screenshot", help=argparse.SUPPRESS)
     ap.add_argument("--screenshot-after", type=float, default=5, help=argparse.SUPPRESS)
+    ap.add_argument("--size", help=argparse.SUPPRESS)          # WxH window size, for screenshots
+    ap.add_argument("--theme", choices=["light", "dark"], help=argparse.SUPPRESS)   # default: follow the system
     args = ap.parse_args()
     run_gui(args)
 
