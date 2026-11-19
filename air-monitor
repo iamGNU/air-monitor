@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Start Air Monitor:  ./air-monitor   (any options are passed on, see ./air-monitor --help)
+# Uses the system Python if it already has the packages; otherwise the first run sets up a private one in .venv.
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+PY=python3
+if ! python3 -c "import numpy, scipy, pyqtgraph, PyQt6" 2>/dev/null; then
+    if [ ! -x .venv/bin/python ]; then
+        echo "First run: installing what Air Monitor needs into .venv (this takes a minute)..."
+        if ! python3 -m venv .venv; then
+            echo "Could not create .venv. Install it with:  sudo apt install python3-venv" >&2
+            exit 1
+        fi
+        .venv/bin/pip install --quiet --upgrade pip
+        .venv/bin/pip install --quiet -r requirements.txt
+    fi
+    PY=.venv/bin/python
+fi
+
+if ! command -v hackrf_transfer >/dev/null; then
+    echo "Note: the HackRF software isn't installed (sudo apt install hackrf). The demo still works." >&2
+fi
+exec "$PY" tools/air_monitor.py "$@"
