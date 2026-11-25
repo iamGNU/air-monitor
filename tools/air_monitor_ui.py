@@ -471,11 +471,12 @@ class Main(QtWidgets.QMainWindow):
             ("ok", "Received", "LoRa packets read correctly (since the window opened, or since Clear).", False, 1),
             ("bad", "Damaged", "LoRa packets that were heard but failed their check (CRC), so their content "
                                "can't be trusted.", False, 1),
-            ("signal", "Signal", "How loud your nodes are at the HackRF (level in dBFS: 0 dBFS is the most it can "
-                                 "take). <b>Too strong</b> means it is overloaded: lower the sensitivity or move "
-                                 "the HackRF further away.", True, 1),
-            ("quality", "Quality", "How clearly packets stand out from the noise (SNR). LoRa still reads packets "
-                                   "a little below 0 dB, so Fair is fine.", True, 1),
+            ("signal", "Signal", "How loud your nodes are at the HackRF: the loudest packet of the last 5 s "
+                                 "(level in dBFS: 0 dBFS is the most it can take). <b>Too strong</b> means it is "
+                                 "overloaded: lower the sensitivity or move the HackRF further away.", True, 1),
+            ("quality", "Quality", "How clearly packets stand out from the noise: the typical (median) SNR of the "
+                                   "last 5 s. LoRa still reads packets a little below 0 dB, so Fair is fine.",
+             True, 1),
             ("rate", "Packets / s", "Packets read correctly per second, over the last 5 s.", False, 0),
             ("other", "Other signals", "Bursts on the channel that are not LoRa: Wi-Fi, Bluetooth, microwave "
                                        "ovens… (since the window opened).", False, 0),
@@ -573,7 +574,7 @@ class Main(QtWidgets.QMainWindow):
         t = self.table = QtWidgets.QTableWidget(0, len(COLS))
         t.setHorizontalHeaderLabels(COLS)
         heads = {1: "OK: read correctly. Damaged: heard, but failed its check (CRC).",
-                 2: "How clearly the packet stood out from the noise.", 3: "The text the node sent.",
+                 2: "How clearly the packet stood out from the noise.", 3: "What the node sent: its text, or its bytes in hex if it isn't text.",
                  4: "Time since the previous LoRa packet.", 5: "Payload length in bytes.",
                  6: "Header and payload checksums.", 7: "Level at the HackRF (0 dBFS = full scale).",
                  8: "Signal-to-noise ratio in the channel.", 9: "Carrier frequency error.",
@@ -980,10 +981,13 @@ class Main(QtWidgets.QMainWindow):
     def add_row(self, pk, text, fmt):
         kind = pk["kind"]
         label, color = self.kind[kind]
+        is_text = True
         if kind == "other":
             msg = "Not LoRa (Wi-Fi, Bluetooth…)"
+        elif not pk["data"]:
+            msg = "(empty)" if kind == "ok" else "Couldn't read this packet"
         else:
-            msg = text.rstrip() or ("(empty)" if kind == "ok" else "Couldn't read this packet")
+            msg, is_text = lh.payload_text(pk["data"])
         quality = "" if kind == "other" else lh.quality_rating(pk["snr_db"]).word
         crc = "" if pk["crc_ok"] is None else ("ok" if pk["crc_ok"] and pk["header_ok"] else "BAD")
         row = [datetime.datetime.fromtimestamp(pk["wall"]).strftime("%H:%M:%S.%f")[:-3], label, quality, msg,
@@ -996,10 +1000,12 @@ class Main(QtWidgets.QMainWindow):
                 it.setForeground(QtGui.QColor(color))
             elif i in (2, 3) and kind != "ok":
                 it.setForeground(QtGui.QColor(self.c["muted"]))
-            elif i == 11:
+            if i == 11 or (i == 3 and not is_text):
                 it.setFont(self.mono)
             if i == 3 and kind == "bad":
-                it.setToolTip("Damaged packet: this text may be wrong.")
+                it.setToolTip("Damaged packet: this content may be wrong.")
+            elif i == 3 and not is_text:
+                it.setToolTip("Binary data (not text), shown as bytes in hex.")
             self.table.setItem(0, i, it)
         if self.table.rowCount() > MAX_ROWS:
             self.table.removeRow(MAX_ROWS)
@@ -1063,14 +1069,23 @@ class Main(QtWidgets.QMainWindow):
             for k in ("signal", "quality", "interval", "cfo"):
                 T[k].set("–")
             return
-        stale = self.worker is None or self.now - pk["stream_s"] > lh.WINDOW_S
+        # Signal and Quality use the same last-5-s summary as the status line, so they never disagree with it.
+        # With no LoRa packet in that window, show the last packet's values, greyed out.
+        summary = lh.window_summary(self.recent)
+        stale = self.worker is None or summary is None
+        if summary:
+            level, snr = summary
+            cap_level, cap_snr = f"peak {level:.1f} dBFS · last 5 s", f"median {snr:.1f} dB SNR · last 5 s"
+        else:
+            level, snr = pk["level_db"], pk["snr_db"]
+            cap_level, cap_snr = f"{level:.1f} dBFS · last packet", f"{snr:.1f} dB SNR · last packet"
 
         def show(tile, r, caption):
             text_color = c["muted"] if stale else None if r.level == "ok" else c[r.level]
             bar_color = c["muted"] if stale else c[r.level]
             tile.set(r.word, text_color, r.bars, bar_color, caption if self.details else None)
-        show(T["signal"], lh.signal_rating(pk["level_db"]), f"{pk['level_db']:.1f} dBFS")
-        show(T["quality"], lh.quality_rating(pk["snr_db"]), f"{pk['snr_db']:.1f} dB SNR")
+        show(T["signal"], lh.signal_rating(level), cap_level)
+        show(T["quality"], lh.quality_rating(snr), cap_snr)
         T["interval"].set("–" if pk["dt_ms"] is None else f"{pk['dt_ms']:.1f} ms")
         T["cfo"].set("–" if pk["cfo_khz"] is None else f"{pk['cfo_khz']:+.1f} kHz")
 

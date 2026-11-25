@@ -68,17 +68,36 @@ def step_sensitivity(lna, vga, direction):
     return higher[0] if higher else None
 
 
-def gain_advice(recent):
-    """'lower' if a node is overloading the HackRF, 'raise' if the packets are weak, else None.
+def window_summary(recent):
+    """(loudest level dBFS, median SNR dB) of the LoRa packets in `recent`, or None if there are none.
+    The status line and the Signal and Quality tiles all use these, so they always agree.
     recent: (stream_s, kind, level_db, snr_db) tuples."""
     lora = [r for r in recent if r[1] in ("ok", "bad")]
     if not lora:
         return None
-    if max(r[2] for r in lora) > CLIP_DB:
+    return max(r[2] for r in lora), statistics.median(r[3] for r in lora)
+
+
+def gain_advice(recent):
+    """'lower' if a node is overloading the HackRF, 'raise' if the packets are weak, else None."""
+    summary = window_summary(recent)
+    if summary is None:
+        return None
+    peak, snr = summary
+    if peak > CLIP_DB:
         return "lower"
-    if statistics.median(r[3] for r in lora) < WEAK_SNR_DB:
+    if snr < WEAK_SNR_DB:
         return "raise"
     return None
+
+
+def payload_text(data):
+    """How to show a payload in the Messages list: (shown, is_text). Text when it reads as text (printable
+    ASCII, ignoring trailing spaces and NUL padding), else its bytes in hex, e.g. binary sensor data."""
+    body = bytes(data).rstrip(b"\0 ")
+    if body and all(32 <= b < 127 for b in body):
+        return body.decode("ascii"), True
+    return bytes(data).hex(" "), False
 
 
 # --------------------------------------------------------------------------------------------- status

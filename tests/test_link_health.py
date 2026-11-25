@@ -54,6 +54,31 @@ class Sensitivity(unittest.TestCase):
         self.assertIsNone(lh.gain_advice([pk(1), pk(2)]))
 
 
+class Summary(unittest.TestCase):
+    def test_window_summary(self):
+        self.assertIsNone(lh.window_summary([]))
+        self.assertIsNone(lh.window_summary([pk(1, "other")]))
+        self.assertEqual(lh.window_summary([pk(1, level=-20, snr=5), pk(2, "bad", level=-9, snr=15),
+                                            pk(3, level=-30, snr=12), pk(4, "other", level=-3)]), (-9, 12))
+
+    def test_tile_agrees_with_status(self):
+        # seen on the bench: the last packet at -12.9 dBFS ("Strong"), an earlier one at -11.3 ("Too strong")
+        recent = [pk(1.0, level=-11.3), pk(1.1, level=-12.9)]
+        self.assertEqual(status(recent=recent).headline, "Signal too strong")
+        self.assertEqual(lh.signal_rating(lh.window_summary(recent)[0]).word, "Too strong")
+
+
+class Payload(unittest.TestCase):
+    def test_text(self):
+        self.assertEqual(lh.payload_text(b"node-1 temp 21.5 C  "), ("node-1 temp 21.5 C", True))
+        self.assertEqual(lh.payload_text(b"hello #000001\0"), ("hello #000001", True))   # lora_phy test packets
+
+    def test_binary(self):
+        self.assertEqual(lh.payload_text(bytes.fromhex("a5d708")), ("a5 d7 08", False))   # seen on the bench
+        self.assertEqual(lh.payload_text(bytes.fromhex("a55508")), ("a5 55 08", False))   # 0x55 = "U", still hex
+        self.assertEqual(lh.payload_text(b"\0\0"), ("00 00", False))
+
+
 class Status(unittest.TestCase):
     def test_order(self):
         self.assertEqual(status(error="hackrf_open() failed: HackRF not found (-5)").headline, "HackRF not found")
