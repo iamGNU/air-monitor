@@ -21,9 +21,11 @@ This file is the receiver (DSP); the window is air_monitor_ui.py.
 """
 import argparse
 import collections
+import io
 import multiprocessing as mp
 import os
 import queue
+import signal as os_signal
 import subprocess
 import sys
 import threading
@@ -34,6 +36,7 @@ from scipy import fft as sfft, signal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lora_phy as phy  # noqa: E402  (SF, BW, N, DOWN, wrap, decode_payload)
+import radio_config  # noqa: E402
 
 CH = 2440.0e6              # channel centre
 FS = 6.5e6                 # HackRF sample rate = 4 x chip rate
@@ -52,12 +55,40 @@ THR_DB = 10.0                        # energy threshold above the noise floor (b
 END_DB = 4.0                         # a strong burst ends after 4 blocks below this (hysteresis)
 PRE_RATIO = 4.5                      # dechirped peak / mean magnitude for a preamble block (noise is ~2.5)
 PRE_RUN = 4                          # consecutive preamble blocks to trigger on a weak packet
-WEAK_LEN = 120                       # blocks decoded after a weak (below-threshold) preamble (~9.5 ms)
+WEAK_LEN = 120                       # blocks a weak (below-threshold) burst counts as busy (~9.5 ms)
 WORKERS = min(4, os.cpu_count() or 1)   # threads for the FFTs
 LOGS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 
 DOWN = np.array(phy.DOWN, np.complex64)   # dechirps upchirps
 UP = np.conj(DOWN)                        # dechirps downchirps
+CUTOFF = 0.95e6                           # channel filter cut-off
+RADIO = radio_config.DEFAULT              # the settings above, as radio_config.Radio
+
+
+def _packet_lengths():
+    """(payload symbols of the longest LoRa packet, 255 bytes; blocks to keep after a weak preamble to decode it).
+    A weak packet's end can't be seen, so it is decoded from a window that fits the longest one."""
+    max_symbols = len(phy.encode_symbols(bytes(255)))
+    return max_symbols, int(phy.PREAMBLE + 4.25) + 1 + max_symbols + 4
+
+
+MAX_SYMBOLS, WEAK_SPAN = _packet_lengths()   # 378 and 399 at SF7, CR 4/5
+
+
+def configure(radio):
+    """Use other radio settings (radio_config.Radio). The defaults are the values above. Call before making a
+    Receiver; every process calls it (the window, and the receiver process via Worker)."""
+    global RADIO, CH, FS, OS, OFFSET, FC, N, BW, BLOCK, HZ_PER_BIN, HIST_BLOCKS, DOWN, UP, CUTOFF, \
+        MAX_SYMBOLS, WEAK_SPAN
+    phy.configure(radio.sf, radio.bw, radio.cr - 4)
+    RADIO, CH, BW, N = radio, radio.freq_hz, phy.BW, phy.N
+    OS, FS, OFFSET, CUTOFF, BLOCK = radio.os, radio.fs, radio.offset, radio.cutoff, radio.block
+    FC = CH - OFFSET
+    HZ_PER_BIN = BW / N
+    HIST_BLOCKS = int(2.5 * BW / N)
+    DOWN = np.array(phy.DOWN, np.complex64)
+    UP = np.conj(DOWN)
+    MAX_SYMBOLS, WEAK_SPAN = _packet_lengths()
 
 
 # --------------------------------------------------------------------------------------------- LoRa DSP
@@ -135,7 +166,7 @@ def decode_symbols(x, start):
 
     sync = tuple(syms_at([ks, ks + N]))
     pay = ks + sfd
-    count = min(300, (len(x) - pay) // N)
+    count = min(MAX_SYMBOLS + 8, (len(x) - pay) // N)                  # up to the longest packet
     syms = syms_at(pay + N * np.arange(count)) if count > 0 else []
     # Frequency error: an upchirp's dechirped peak moves with (CFO - timing), a downchirp's with (CFO + timing).
     down = fpeaks(x, [ks + 2 * N], UP)[0][0]
@@ -148,9 +179,9 @@ def decode_symbols(x, start):
 class Receiver:
     """Turns raw HackRF int8 IQ (at FS, tuned to fc) into spectrum rows, channel power and decoded packets."""
 
-    def __init__(self, fc=FC):
-        self.offset = CH - fc
-        self.h = signal.firwin(65, 0.95e6, fs=FS).astype(np.float32)
+    def __init__(self, fc=None):
+        self.offset = CH - (FC if fc is None else fc)          # (FC read now: configure() may have changed it)
+        self.h = signal.firwin(65, CUTOFF, fs=FS).astype(np.float32)
         self.tail = np.zeros(len(self.h) - 1, np.complex64)    # filter history (overlap-save)
         self.n = 0                                      # input samples so far
         self.mix_base = np.exp(-2j * np.pi * self.offset / FS * np.arange(BLOCK)).astype(np.complex64)
@@ -264,7 +295,8 @@ class Receiver:
         packets, keep = [], []
         for bu in self.pending:
             s_chip = (bu["start"] - 4) * N
-            e_chip = (max(bu["end"], bu["start"] + WEAK_LEN) + 24) * N      # room for the longest packet
+            # room for the packet: a strong burst's end is measured; a weak one gets room for the longest packet
+            e_chip = (max(bu["end"], bu["start"] + (WEAK_LEN if bu["strong"] else WEAK_SPAN)) + 24) * N
             if e_chip > end:
                 keep.append(bu)
                 continue
@@ -357,6 +389,85 @@ def _read_exact(src, n):
     return b"".join(chunks)
 
 
+def hackrf_command(lna, vga, target="-", extra=()):
+    """hackrf_transfer receiving at the current settings into `target` ("-" = stdout). RF amp off."""
+    return ["hackrf_transfer", "-r", target, "-f", str(int(FC)), "-s", str(int(FS)), "-a", "0",
+            "-l", str(lna), "-g", str(vga), *extra]
+
+
+def open_hackrf(lna, vga, extra=()):
+    """Start hackrf_transfer. Returns (proc, src): src is a binary file object to read the int8 IQ from; read
+    proc.stderr for its messages. Linux/macOS: its stdout. Windows: a named pipe, because there hackrf_transfer
+    writes stdout in text mode, which would corrupt the samples (every 0x0A byte becomes 0x0D 0x0A)."""
+    if os.name == "nt":
+        return _open_hackrf_windows(lna, vga, extra)
+    proc = subprocess.Popen(hackrf_command(lna, vga, "-", extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            bufsize=0)
+    try:                                          # Linux: 1 MB pipe = 80 ms of slack instead of 5 ms
+        import fcntl
+        fcntl.fcntl(proc.stdout.fileno(), 1031, 1 << 20)       # F_SETPIPE_SZ
+    except (ImportError, OSError):                # no fcntl (Windows), or not Linux (macOS)
+        pass
+    return proc, proc.stdout
+
+
+def _open_hackrf_windows(lna, vga, extra):
+    """Windows: hackrf_transfer writes into a named pipe it opens in binary mode ("wb"). We create the pipe
+    (with ctypes: no extra packages), start it, and wait for it to connect. If it gives up before that (no HackRF,
+    busy...), src is empty and its error is on stderr."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateNamedPipeW.restype = wintypes.HANDLE
+    k32.CreateNamedPipeW.argtypes = [wintypes.LPCWSTR] + [wintypes.DWORD] * 6 + [wintypes.LPVOID]
+    k32.ConnectNamedPipe.restype = wintypes.BOOL
+    k32.ConnectNamedPipe.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    invalid = wintypes.HANDLE(-1).value
+    name = rf"\\.\pipe\air-monitor-{os.getpid()}-{time.monotonic_ns()}"
+    pipe = k32.CreateNamedPipeW(name, 0x1, 0, 1, 0, 1 << 20, 0, None)     # inbound, byte mode, 1 MB buffer
+    if pipe in (None, invalid):
+        raise ctypes.WinError(ctypes.get_last_error())
+    proc = subprocess.Popen(hackrf_command(lna, vga, name, extra), stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+    connected = threading.Event()
+
+    def connect():                                # returns when hackrf_transfer opens the pipe (or we do)
+        k32.ConnectNamedPipe(pipe, None)
+        connected.set()
+    threading.Thread(target=connect, daemon=True).start()
+    while not connected.wait(0.05):
+        if proc.poll() is not None:               # it exited without opening the pipe: end the wait ourselves
+            h = k32.CreateFileW(name, 0x40000000, 0, None, 3, 0, None)   # GENERIC_WRITE, OPEN_EXISTING
+            if h not in (None, invalid):
+                k32.CloseHandle(h)
+            connected.wait(1)
+            k32.CloseHandle(pipe)
+            return proc, io.BytesIO()
+    return proc, os.fdopen(msvcrt.open_osfhandle(pipe, os.O_RDONLY), "rb", buffering=0)
+
+
+def stop_hackrf(proc, src):
+    """Stop hackrf_transfer so that it releases the HackRF cleanly. Linux/macOS: SIGINT. Windows (no SIGINT for
+    a child process): closing our end of the pipe makes its next write fail, which ends its main loop the same
+    way. Either way, kill it if it is still there after 3 s."""
+    if proc.poll() is None and os.name != "nt":
+        proc.send_signal(os_signal.SIGINT)
+    try:
+        src.close()                               # also unblocks it if it is stuck writing to the pipe
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def _stop_requested(ctl_q):
     try:
         while True:
@@ -366,19 +477,21 @@ def _stop_requested(ctl_q):
         return False
 
 
-def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime, loop=False, demo=False):
+def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime, loop=False, demo=False, radio=None):
     """Runs in its own process, so the window never slows the receiver down.
     A reader thread pulls IQ from hackrf_transfer (or a file) into a 2 s buffer and records it if asked; the
     main loop runs the Receiver. If the buffer ever overflows, whole blocks are dropped, counted and shown,
     and the Receiver is told about the gap so packet timing stays right.
     demo: replay the synthetic capture from demo_capture.py (made here on first use, so the window stays live),
-    looping. loop: start a file again at its end."""
+    looping. loop: start a file again at its end. radio: the radio settings (this is a separate process)."""
+    if radio is not None:
+        configure(radio)
     blocks = queue.Queue(maxsize=40)
     stop = threading.Event()
     rec_lock = threading.Lock()
     st = dict(read=0, dropped=0, t0=None, rec=None)
     err_lines = collections.deque(maxlen=5)
-    proc = None
+    proc = src = reader_thread = None
     try:
         if demo:
             out_q.put(("status", "Preparing the demo…"))
@@ -388,20 +501,12 @@ def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime, loop=False, demo=F
             src = open(file, "rb")
             out_q.put(("status", f"Replaying {os.path.basename(file)}"))
         else:
-            cmd = ["hackrf_transfer", "-r", "-", "-f", str(int(FC)), "-s", str(int(FS)),
-                   "-a", "0", "-l", str(lna), "-g", str(vga)]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-            try:                                          # 1 MB pipe = 80 ms of slack instead of 5 ms
-                import fcntl
-                fcntl.fcntl(proc.stdout.fileno(), 1031, 1 << 20)       # F_SETPIPE_SZ
-            except OSError:
-                pass
+            proc, src = open_hackrf(lna, vga)
 
             def drain():
                 for line in iter(proc.stderr.readline, b""):
                     err_lines.append(line.decode(errors="replace").strip())
             threading.Thread(target=drain, daemon=True).start()
-            src = proc.stdout
             out_q.put(("status", f"HackRF receiving: {FC / 1e6:.1f} MHz, {FS / 1e6:.1f} MS/s, "
                                  f"LNA {lna} dB, VGA {vga} dB, amp off"))
 
@@ -430,7 +535,8 @@ def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime, loop=False, demo=F
                     lag = idx / FS - (time.time() - st["t0"])
                     if lag > 0:
                         time.sleep(lag)
-        threading.Thread(target=reader, daemon=True).start()
+        reader_thread = threading.Thread(target=reader, daemon=True)
+        reader_thread.start()
 
         rx = Receiver(fc=file_fc if file else FC)
         expected = 0
@@ -482,16 +588,14 @@ def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime, loop=False, demo=F
         out_q.put(("error", f"{type(e).__name__}: {e}"))
     finally:
         stop.set()
-        if proc and proc.poll() is None:
-            proc.send_signal(2)                           # SIGINT: hackrf_transfer stops the HackRF cleanly
-            try:
-                proc.stdout.close()                       # unblocks it if it is stuck writing to the pipe
-            except OSError:
-                pass
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        if proc:
+            if os.name == "nt" and reader_thread:         # let the reader leave its read before the pipe closes
+                reader_thread.join(1)
+            stop_hackrf(proc, src)
+        elif src is not None:                             # a recording
+            if reader_thread:
+                reader_thread.join(1)
+            src.close()
         with rec_lock:
             if st["rec"]:
                 st["rec"].close()
@@ -500,11 +604,12 @@ def dsp_main(out_q, ctl_q, lna, vga, file, file_fc, realtime, loop=False, demo=F
 class Worker:
     """Starts and stops the DSP process. Results arrive on the queue passed in."""
 
-    def __init__(self, q, lna, vga, file=None, file_fc=FC, realtime=True, loop=False, demo=False):
+    def __init__(self, q, lna, vga, file=None, file_fc=None, realtime=True, loop=False, demo=False):
         self.q = q
         self.ctl = mp.Queue()
-        self.p = mp.Process(target=dsp_main, args=(q, self.ctl, lna, vga, file, file_fc, realtime, loop, demo),
-                            daemon=True)
+        self.p = mp.Process(target=dsp_main, daemon=True,
+                            args=(q, self.ctl, lna, vga, file, FC if file_fc is None else file_fc, realtime, loop,
+                                  demo, RADIO))
 
     def start(self):
         self.p.start()
@@ -537,11 +642,14 @@ def run_gui(args):
     air_monitor_ui.run(args)
 
 
-def main():
+def parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--demo", action="store_true", help="play a built-in example recording (no HackRF needed)")
     ap.add_argument("--file", help="replay an int8 IQ capture (6.5 MS/s) instead of the HackRF")
-    ap.add_argument("--file-fc", type=float, default=FC / 1e6, help="centre frequency of --file in MHz")
+    ap.add_argument("--file-fc", type=float,
+                    help="centre frequency of --file in MHz (default: where the HackRF is tuned, 1.5 MHz below "
+                         "the channel)")
+    ap.add_argument("--config", help="radio settings file (default: air-monitor.toml, if it exists)")
     ap.add_argument("--fast", action="store_true", help="replay --file as fast as possible")
     ap.add_argument("--lna", type=int, choices=[0, 8, 16, 24, 32, 40],
                     help="HackRF LNA gain dB (default: the last sensitivity used, Normal = 16)")
@@ -554,7 +662,16 @@ def main():
     ap.add_argument("--screenshot-after", type=float, default=5, help=argparse.SUPPRESS)
     ap.add_argument("--size", help=argparse.SUPPRESS)          # WxH window size, for screenshots
     ap.add_argument("--theme", choices=["light", "dark"], help=argparse.SUPPRESS)   # default: follow the system
-    args = ap.parse_args()
+    ap.add_argument("--settings", help=argparse.SUPPRESS)      # an .ini file in place of the user's saved choices
+    return ap
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        args.radio = radio_config.load(args.config)
+    except radio_config.ConfigError as e:
+        sys.exit(f"Air Monitor can't start: there is a problem in the radio settings.\n{e}")
     run_gui(args)
 
 

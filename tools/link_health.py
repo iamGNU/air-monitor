@@ -5,13 +5,16 @@ No Qt here, so it can be tested on its own: python3 -m unittest discover tests
 The thresholds are starting points, to be tuned on the bench.
 """
 import collections
+import os
 import statistics
 
 WINDOW_S = 5.0          # the status looks at the last 5 s of packets
 CLIP_DB = -12.0         # LoRa level above this (dBFS): the HackRF is close to clipping
 WEAK_SNR_DB = 0.0       # median LoRa SNR below this: the signal is weak (SF7 still decodes to about -7.5 dB)
-ERROR_RATIO = 0.2       # share of damaged LoRa packets that turns the status amber (at least ERROR_MIN of them)
+ERROR_RATIO = 0.2       # share of lost LoRa packets that turns the status amber (at least ERROR_MIN of them)
 ERROR_MIN = 2
+LOSS_WARN_PCT = 1.0     # packet loss since Start: amber from 1 %, red from 5 %
+LOSS_BAD_PCT = 5.0
 
 # Sensitivity presets: (LNA dB, VGA dB). Normal is the old default. Low and High are first guesses.
 SENSITIVITY = {"Low": (8, 10), "Normal": (16, 20), "High": (32, 30)}
@@ -68,17 +71,32 @@ def step_sensitivity(lna, vga, direction):
     return higher[0] if higher else None
 
 
-def gain_advice(recent):
-    """'lower' if a node is overloading the HackRF, 'raise' if the packets are weak, else None.
+def window_summary(recent):
+    """(loudest level dBFS, median SNR dB) of the LoRa packets in `recent`, or None if there are none.
+    The status line and the Signal and Quality tiles all use these, so they always agree.
     recent: (stream_s, kind, level_db, snr_db) tuples."""
     lora = [r for r in recent if r[1] in ("ok", "bad")]
     if not lora:
         return None
-    if max(r[2] for r in lora) > CLIP_DB:
+    return max(r[2] for r in lora), statistics.median(r[3] for r in lora)
+
+
+def gain_advice(recent):
+    """'lower' if a node is overloading the HackRF, 'raise' if the packets are weak, else None."""
+    summary = window_summary(recent)
+    if summary is None:
+        return None
+    peak, snr = summary
+    if peak > CLIP_DB:
         return "lower"
-    if statistics.median(r[3] for r in lora) < WEAK_SNR_DB:
+    if snr < WEAK_SNR_DB:
         return "raise"
     return None
+
+
+def loss_level(pct):
+    """'ok', 'warn' or 'bad' for a packet loss percentage."""
+    return "bad" if pct >= LOSS_BAD_PCT else "warn" if pct >= LOSS_WARN_PCT else "ok"
 
 
 # --------------------------------------------------------------------------------------------- status
@@ -87,9 +105,11 @@ def _ago(seconds):
 
 
 def link_status(*, running, have_data=False, error=None, finished=False, recent=(), now=0.0, ever_lora=False,
-                data_lost=False, can_tune=True, lna=16, vga=20, starting="Waking up the HackRF…"):
+                data_lost=False, can_tune=True, lna=16, vga=20, starting="Waking up the HackRF…", loss_pct=None):
     """The one-line answer to 'is my link working?', checked in order of importance.
-    recent: (stream_s, kind, level_db, snr_db) for the last WINDOW_S seconds; now: stream seconds of this run."""
+    recent: (stream_s, kind, level_db, snr_db) for the last WINDOW_S seconds, kind "ok", "bad", "other" or
+    "missed" (a packet the counter says was never heard); now: stream seconds of this run.
+    loss_pct: packet loss since Start, when the packets carry a counter (see payloads.py)."""
     if error:
         head, detail = friendly_error(error)
         return Status("bad", head, detail, None)
@@ -121,18 +141,28 @@ def link_status(*, running, have_data=False, error=None, finished=False, recent=
     lora = [r for r in recent if r[1] in ("ok", "bad")]
     ok = [r for r in lora if r[1] == "ok"]
     bad = len(lora) - len(ok)
+    missed = sum(1 for r in recent if r[1] == "missed")
+    lost, sent = bad + missed, len(lora) + missed
     weak = advice == "raise"
     fix_weak = "raise" if weak and can["raise"] else None
     weak_hint = " Raise the sensitivity or move the HackRF closer." if fix_weak else \
         " Move the HackRF closer to the nodes." if weak and can_tune else ""
-    if bad >= ERROR_MIN and bad / len(lora) >= ERROR_RATIO:
-        detail = f"{bad} of {len(lora)} packets in the last {WINDOW_S:.0f} s failed their check."
+    if lost >= ERROR_MIN and lost / sent >= ERROR_RATIO:
+        if missed:
+            head = "Some packets are lost"
+            detail = (f"{lost} of {sent} packets in the last {WINDOW_S:.0f} s were lost "
+                      f"({bad} damaged, {missed} not heard).")
+        else:
+            head = "Some packets are damaged"
+            detail = f"{bad} of {sent} packets in the last {WINDOW_S:.0f} s failed their check."
         detail += " The signal is weak." + weak_hint if weak else \
             " Another transmitter may be talking at the same time, or a node may be too far away."
-        return Status("warn", "Some packets are damaged", detail, fix_weak)
+        return Status("warn", head, detail, fix_weak)
     if ok:
         window = min(WINDOW_S, max(now, 1.0))
         detail = f"{len(ok) / window:.1f} packets/s · last one {_ago(now - ok[-1][0])}"
+        if loss_pct is not None:
+            detail += f" · {loss_pct:.1f} % lost"
         if weak:
             return Status("warn", "Link is working, but the signal is weak", detail + "." + weak_hint, fix_weak)
         return Status("ok", "Link is working", detail, None)
@@ -145,20 +175,28 @@ def link_status(*, running, have_data=False, error=None, finished=False, recent=
 
 
 # --------------------------------------------------------------------------------------------- errors
-def friendly_error(raw):
-    """(headline, what to do) for an error from hackrf_transfer or the receiver. The raw text stays available."""
+def friendly_error(raw, windows=None):
+    """(headline, what to do) for an error from hackrf_transfer or the receiver. The raw text stays available.
+    windows: give the Windows advice (default: when running on Windows)."""
+    windows = os.name == "nt" if windows is None else windows
     t = (raw or "").lower().replace("_", " ")          # HACKRF_ERROR_NOT_FOUND -> "... not found"
-    if "hackrf transfer" in t and ("no such file" in t or "not installed" in t):
+    if ("hackrf transfer" in t and ("no such file" in t or "not installed" in t)) or \
+            "cannot find the file specified" in t:     # Windows, when the program itself is missing
         return ("HackRF software isn't installed",
-                "Install it with  sudo apt install hackrf  and then press Start again.")
+                "Install the HackRF tools for Windows and add their folder to PATH (see the README), then press "
+                "Start again." if windows else "Install it with  sudo apt install hackrf  and then press Start again.")
     if "not found" in t or "no hackrf boards" in t:
         return ("HackRF not found",
-                "Check that the HackRF is plugged in (try another USB port or cable), then press Start.")
+                "Check that the HackRF is plugged in (try another USB port or cable). If it is, Windows may need "
+                "its USB driver: install WinUSB for it with Zadig (see the README). Then press Start." if windows
+                else "Check that the HackRF is plugged in (try another USB port or cable), then press Start.")
     if "busy" in t:
         return ("The HackRF is in use",
                 "Another program (for example Gqrx or SDR++) is using it. Close that program, then press Start.")
     if "access" in t or "permission" in t:
         return ("No permission to use the HackRF",
+                "Windows may need its USB driver: install WinUSB for it with Zadig (see the README), then unplug "
+                "and replug it." if windows else
                 "Install the HackRF udev rules (they come with the hackrf package), then unplug and replug it.")
     if "usb error" in t or "libusb" in t:
         return ("The HackRF couldn't be opened",
@@ -166,3 +204,76 @@ def friendly_error(raw):
     if "no such file" in t:
         return ("Recording not found", "The file was moved or deleted. Open another one from the ⋯ menu.")
     return ("The HackRF stopped unexpectedly", "Check the USB cable, then press Start again.")
+
+
+def should_retry(raw):
+    """True if the error can fix itself (HackRF unplugged, busy, USB hiccup), so the monitor should wait for the
+    HackRF and start again by itself. False when the user has to act first (software missing, no permission)."""
+    head, _ = friendly_error(raw)
+    return head in ("HackRF not found", "The HackRF is in use", "The HackRF couldn't be opened",
+                    "The HackRF stopped unexpectedly")
+
+
+def waiting_status(raw):
+    """The status line while waiting for the HackRF to come back."""
+    head, _ = friendly_error(raw)
+    what = {"HackRF not found": "Plug the HackRF in (or try another USB port)",
+            "The HackRF is in use": "Close the other program using it (for example Gqrx)"}.get(
+        head, "Check the HackRF's USB cable")
+    return Status("warn", head, f"{what}. Listening starts again by itself.", None)
+
+
+# --------------------------------------------------------------------------------------------- alerts
+class LinkAlert:
+    """Says once when a working link drops, and once when it comes back. Call update() regularly while
+    listening, with whether any good packet arrived in the last WINDOW_S; call reset() when the receiver restarts,
+    so a sensitivity change is not taken for a dropped link."""
+    WORKING_S = 5.0          # the link must have worked this long before a drop is worth an alert
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.state, self.since = "idle", None
+
+    def update(self, now, has_packets):
+        """Returns "dropped", "back" or None."""
+        if has_packets:
+            if self.state == "dropped":
+                self.state, self.since = "up", now
+                return "back"
+            if self.state == "idle":
+                self.state, self.since = "up", now
+            return None
+        if self.state == "up":
+            if now - self.since >= self.WORKING_S:
+                self.state = "dropped"
+                return "dropped"
+            self.reset()
+        return None
+
+
+# --------------------------------------------------------------------------------------------- find best
+def pick_sensitivity(trials):
+    """Choose a sensitivity from a short trial of each: {name: dict(ok, bad, not_heard, peak, snr)} (peak and snr
+    None when nothing was heard). Returns (name or None, explanation). Settings that overload the HackRF are out;
+    then the lowest loss wins, then the higher SNR."""
+    def loss(t):
+        lost = t["bad"] + t["not_heard"]
+        return lost / (t["ok"] + lost) if t["ok"] + lost else 1.0
+
+    def line(n, t):
+        if t["ok"] + t["bad"] == 0:
+            return f"{n}: nothing heard"
+        return f"{n}: {100 * loss(t):.0f} % lost" + (", too strong" if t["peak"] > CLIP_DB else "")
+    heard = {n: t for n, t in trials.items() if t["ok"] + t["bad"] > 0}
+    why = " · ".join(line(n, t) for n, t in trials.items())
+    if not heard:
+        return None, "No packets heard at any sensitivity. Is a node switched on and transmitting?"
+    clean = {n: t for n, t in heard.items() if t["peak"] <= CLIP_DB}
+    if not clean:
+        low = ORDER[0]
+        return low, f"Every setting overloads the HackRF, so {low} is used: move the HackRF further from " \
+                    f"the node. ({why})"
+    best = min(clean, key=lambda n: (round(loss(clean[n]), 3), -clean[n]["snr"]))
+    return best, why

@@ -54,6 +54,20 @@ class Sensitivity(unittest.TestCase):
         self.assertIsNone(lh.gain_advice([pk(1), pk(2)]))
 
 
+class Summary(unittest.TestCase):
+    def test_window_summary(self):
+        self.assertIsNone(lh.window_summary([]))
+        self.assertIsNone(lh.window_summary([pk(1, "other")]))
+        self.assertEqual(lh.window_summary([pk(1, level=-20, snr=5), pk(2, "bad", level=-9, snr=15),
+                                            pk(3, level=-30, snr=12), pk(4, "other", level=-3)]), (-9, 12))
+
+    def test_tile_agrees_with_status(self):
+        # seen on the bench: the last packet at -12.9 dBFS ("Strong"), an earlier one at -11.3 ("Too strong")
+        recent = [pk(1.0, level=-11.3), pk(1.1, level=-12.9)]
+        self.assertEqual(status(recent=recent).headline, "Signal too strong")
+        self.assertEqual(lh.signal_rating(lh.window_summary(recent)[0]).word, "Too strong")
+
+
 class Status(unittest.TestCase):
     def test_order(self):
         self.assertEqual(status(error="hackrf_open() failed: HackRF not found (-5)").headline, "HackRF not found")
@@ -90,6 +104,22 @@ class Status(unittest.TestCase):
         self.assertIn("2 of 4", s.detail)
         self.assertEqual(status(recent=[pk(1), pk(2, "bad"), pk(3), pk(4)]).level, "ok")   # one bad: still fine
 
+    def test_lost_not_heard(self):
+        # the counter says 2 packets were never heard, one more was damaged
+        s = status(recent=[pk(1), pk(2, "bad"), pk(2.1, "missed"), pk(2.2, "missed"), pk(3), pk(4)])
+        self.assertEqual((s.level, s.headline), ("warn", "Some packets are lost"))
+        self.assertIn("3 of 6", s.detail)
+        self.assertIn("1 damaged, 2 not heard", s.detail)
+
+    def test_loss_in_detail(self):
+        s = status(recent=[pk(4.0), pk(4.5)], loss_pct=0.4)
+        self.assertEqual(s.level, "ok")
+        self.assertTrue(s.detail.endswith("· 0.4 % lost"), s.detail)
+        self.assertNotIn("lost", status(recent=[pk(4.0)]).detail)        # no counter: no loss figure
+
+    def test_loss_level(self):
+        self.assertEqual([lh.loss_level(p) for p in (0, 0.9, 1, 4.9, 5)], ["ok", "ok", "warn", "warn", "bad"])
+
     def test_damaged_and_weak(self):
         s = status(recent=[pk(1, "bad", snr=-4), pk(2, "bad", snr=-3), pk(3, snr=-2)])
         self.assertEqual((s.headline, s.action), ("Some packets are damaged", "raise"))
@@ -109,6 +139,70 @@ class Status(unittest.TestCase):
         self.assertIn("Wi-Fi", s.detail)
 
 
+class Retry(unittest.TestCase):
+    def test_should_retry(self):
+        for raw in ("hackrf_open() failed: HackRF not found (-5)", "hackrf_open() failed: Resource busy (-1000)",
+                    "hackrf_open() failed: USB error (-1000)", "hackrf_transfer stopped"):
+            self.assertTrue(lh.should_retry(raw), raw)
+        for raw in ("hackrf_transfer: not installed (not found on the PATH)",
+                    "hackrf_open() failed: USB error (-1000) | LIBUSB_ERROR_ACCESS"):
+            self.assertFalse(lh.should_retry(raw), raw)
+
+    def test_waiting_status(self):
+        s = lh.waiting_status("hackrf_open() failed: HackRF not found (-5)")
+        self.assertEqual((s.level, s.headline), ("warn", "HackRF not found"))
+        self.assertIn("Plug the HackRF in", s.detail)
+        self.assertIn("by itself", s.detail)
+        self.assertIn("Gqrx", lh.waiting_status("hackrf_open() failed: Resource busy (-1000)").detail)
+
+
+class Alert(unittest.TestCase):
+    def test_drop_and_back(self):
+        a = lh.LinkAlert()
+        events = [a.update(t, has) for t, has in [(0, True), (3, True), (6, True), (8, False), (9, False),
+                                                  (10, True), (11, True)]]
+        self.assertEqual(events, [None, None, None, "dropped", None, "back", None])
+
+    def test_short_link_is_not_alerted(self):
+        a = lh.LinkAlert()
+        self.assertEqual([a.update(t, has) for t, has in [(0, True), (2, True), (3, False), (20, False)]],
+                         [None] * 4)
+
+    def test_reset(self):
+        a = lh.LinkAlert()
+        a.update(0, True)
+        a.update(10, True)
+        a.reset()                                     # receiver restarted: no packets for a moment is expected
+        self.assertIsNone(a.update(11, False))
+
+
+class FindBest(unittest.TestCase):
+    def trial(self, ok, bad=0, not_heard=0, peak=-30.0, snr=10.0):
+        return dict(ok=ok, bad=bad, not_heard=not_heard, peak=peak if ok + bad else None, snr=snr)
+
+    def test_bench_2026_11_25(self):
+        # Normal: 144 read, 6 damaged, peak -9 dBFS. Low: 150 read, 0 damaged, peak -34.5 dBFS, SNR 11.
+        name, why = lh.pick_sensitivity({"Low": self.trial(40, peak=-34.5, snr=11.2),
+                                         "Normal": self.trial(38, 2, peak=-9.1, snr=18.8),
+                                         "High": self.trial(30, 9, peak=-3.0, snr=20)})
+        self.assertEqual(name, "Low")
+        self.assertIn("Normal: 5 % lost, too strong", why)
+
+    def test_lowest_loss_then_snr(self):
+        t = {"Low": self.trial(40, 4, snr=3), "Normal": self.trial(40, 0, snr=8), "High": self.trial(40, 0, snr=12)}
+        self.assertEqual(lh.pick_sensitivity(t)[0], "High")
+
+    def test_nothing_heard(self):
+        name, why = lh.pick_sensitivity({n: self.trial(0) for n in lh.ORDER})
+        self.assertIsNone(name)
+        self.assertIn("No packets heard", why)
+
+    def test_all_too_strong(self):
+        name, why = lh.pick_sensitivity({n: self.trial(40, peak=-5) for n in lh.ORDER})
+        self.assertEqual(name, "Low")
+        self.assertIn("further", why)
+
+
 class Errors(unittest.TestCase):
     def test_messages(self):
         cases = {
@@ -125,7 +219,19 @@ class Errors(unittest.TestCase):
             "": "stopped unexpectedly",
         }
         for raw, want in cases.items():
-            self.assertIn(want, lh.friendly_error(raw)[0], raw)
+            for windows in (False, True):
+                self.assertIn(want, lh.friendly_error(raw, windows)[0], raw)
+
+    def test_advice_per_platform(self):
+        missing = "hackrf_transfer: not installed (not found on the PATH)"
+        self.assertIn("sudo apt install hackrf", lh.friendly_error(missing, windows=False)[1])
+        self.assertIn("PATH", lh.friendly_error(missing, windows=True)[1])
+        self.assertNotIn("sudo", lh.friendly_error(missing, windows=True)[1])
+        # Windows names neither the program nor the file when it can't start it
+        self.assertEqual(lh.friendly_error("FileNotFoundError: [WinError 2] The system cannot find the file "
+                                           "specified", windows=True)[0], "HackRF software isn't installed")
+        self.assertIn("Zadig", lh.friendly_error("hackrf_open() failed: HackRF not found (-5)", windows=True)[1])
+        self.assertNotIn("Zadig", lh.friendly_error("hackrf_open() failed: HackRF not found (-5)", False)[1])
 
 
 if __name__ == "__main__":

@@ -20,6 +20,14 @@ PAD = [10, 3, 8, 13, 6]
 N = 1 << SF
 
 
+def configure(sf=7, bw=1_625_000, cr=1):
+    """Use other radio settings (cr: 1-4 for 4/5-4/8). Rebinds the module constants used by every function."""
+    global SF, BW, CR, N, DOWN, UP
+    SF, BW, CR, N = sf, bw, cr, 1 << sf
+    DOWN = [cmath.exp(-1j * math.pi * (u * u / N - u)) for u in range(N)]
+    UP = [z.conjugate() for z in DOWN]
+
+
 # --------------------------------------------------------------------------------------------- bit tools
 def whitening_seq(n):
     s, out = 0xFF, []
@@ -56,7 +64,8 @@ def payload_crc(pl):
     return c ^ pl[-1] ^ (pl[-2] << 8)
 
 
-def header_nibbles(length, cr=CR, has_crc=1):
+def header_nibbles(length, cr=None, has_crc=1):
+    cr = CR if cr is None else cr
     n0, n1, n2 = length >> 4, length & 0xF, (cr << 1) | has_crc
     b = lambda v, k: (v >> k) & 1
     c4 = b(n0, 3) ^ b(n0, 2) ^ b(n0, 1) ^ b(n0, 0)
