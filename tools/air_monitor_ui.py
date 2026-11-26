@@ -1,4 +1,4 @@
-"""Air Monitor window: one calm screen that shows what is happening on 2440 MHz.
+"""Air Monitor window: one calm screen that shows what is happening on the nodes' channel (2440 MHz).
 
 Simple view (the default): a status line in plain words, four numbers, the waterfall ("what's on the air", last
 10 s) with a mark for every packet, the packet strip (last 2 s) and the decoded messages. "Show details" adds the
@@ -10,10 +10,13 @@ ratings, sensitivity, errors) are in link_health.py.
 import collections
 import csv
 import datetime
+import html
 import multiprocessing as mp
 import os
 import queue
 import shutil
+import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -24,16 +27,18 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 import air_monitor as am
 import link_health as lh
+import payloads
+from session import Session
 
 Qt = QtCore.Qt
 WF_ROWS = 200                         # waterfall rows, one per 50 ms read: 10 s
-ROW_S = am.BLOCK / am.FS
 TL_S = 2.0                            # length of the packet strip (s)
 LNA_STEPS = [0, 8, 16, 24, 32, 40]
 MAX_ROWS = 500
 COLS = ["Time", "Status", "Quality", "Message", "Δt ms", "Len", "CRC", "Level dBFS", "SNR dB", "Freq err kHz",
         "Dur ms", "Hex"]
 SIMPLE_COLS = 4                       # the simple view shows the first four columns
+MEASURE_S = 4.0                       # "Find best": seconds of packets measured at each sensitivity
 
 LIGHT = dict(bg="#f4f5f7", card="#ffffff", border="#e1e4e8", text="#1c2026", muted="#6b7280", accent="#2563eb",
              accent_hover="#1d4ed8", sel="#e6eefc", ok="#2e9d4f", warn="#c27c00", bad="#d9534f", idle="#8a929c",
@@ -41,6 +46,27 @@ LIGHT = dict(bg="#f4f5f7", card="#ffffff", border="#e1e4e8", text="#1c2026", mut
 DARK = dict(bg="#121417", card="#1b1e22", border="#2c3036", text="#e6e8eb", muted="#9aa2ad", accent="#3b82f6",
             accent_hover="#2563eb", sel="#243247", ok="#3fb565", warn="#e0a030", bad="#e5605c", idle="#8a929c",
             other="#8a8f96")
+
+
+def notify(window, title, body):
+    """Get the user's attention: a desktop notification, a taskbar flash and a beep. Linux: notify-send. Windows
+    (and anywhere without notify-send): a pop-up from a system tray icon, when there is a tray."""
+    if shutil.which("notify-send"):
+        try:
+            subprocess.Popen(["notify-send", "--app-name=Air Monitor", "--icon=network-wireless", title, body],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+    elif QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+        tray = getattr(window, "_tray", None)
+        if tray is None:
+            icon = window.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MessageBoxInformation)
+            tray = window._tray = QtWidgets.QSystemTrayIcon(icon, window)
+            tray.setToolTip("Air Monitor")
+            tray.show()
+        tray.showMessage(title, body)
+    QtWidgets.QApplication.alert(window)
+    QtWidgets.QApplication.beep()
 
 
 def tip(text):
@@ -179,9 +205,15 @@ class Tile(QtWidgets.QFrame):
         row.addStretch(1)
         self.cap = named(QtWidgets.QLabel(""), "hint")
         self.cap.hide()
-        lay.addWidget(named(QtWidgets.QLabel(title), "tileTitle"))
+        self.title = named(QtWidgets.QLabel(title), "tileTitle")
+        lay.addWidget(self.title)
         lay.addLayout(row)
         lay.addWidget(self.cap)
+
+    def set_title(self, title, tooltip):
+        if self.title.text() != title:
+            self.title.setText(title)
+            self.setToolTip(tip(tooltip))
 
     def set(self, text, color=None, bars=0, bar_color=None, caption=None):
         key = (text, color, bars, bar_color, caption)
@@ -225,18 +257,20 @@ class StatusCard(QtWidgets.QFrame):
         self.more.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.more.toggled.connect(self.tech.setVisible)
         self.more.hide()
+        self.link = named(QtWidgets.QPushButton(), "link")
+        self.link.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.link.hide()
         self.fix = named(QtWidgets.QPushButton(), "primary")
         self.fix.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.fix.setToolTip(tip("Changes the sensitivity by one step. The radio restarts, so about a second of "
-                                "packets is missed."))
         self.fix.hide()
         lay.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignTop)
         lay.addLayout(col, 1)
+        lay.addWidget(self.link, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self.more, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self.fix, 0, Qt.AlignmentFlag.AlignVCenter)
 
-    def set(self, st, tech=None):
-        key = (st, tech)
+    def set(self, st, tech=None, link=None):
+        key = (st, tech, link)
         if key == self.key:
             return
         self.key = key
@@ -249,8 +283,14 @@ class StatusCard(QtWidgets.QFrame):
                                 f"font-weight: 700; font-size: 13pt;")
         self.head.setText(st.headline)
         self.detail.setText(st.detail)
-        self.fix.setText({"lower": "Lower sensitivity", "raise": "Raise sensitivity"}.get(st.action, ""))
+        self.fix.setText({"lower": "Lower sensitivity", "raise": "Raise sensitivity",
+                          "cancel": "Cancel"}.get(st.action, ""))
+        self.fix.setToolTip(tip("Stop trying, and keep the sensitivity you had." if st.action == "cancel" else
+                                "Changes the sensitivity by one step. The radio restarts, so about a second of "
+                                "packets is missed."))
         self.fix.setVisible(bool(st.action))
+        self.link.setText(link or "")
+        self.link.setVisible(bool(link))
         self.tech.setText(tech or "")
         self.more.setVisible(bool(tech))
         if not tech:
@@ -294,23 +334,36 @@ class Main(QtWidgets.QMainWindow):
         self.args, self.c = args, c
         self.kind = {"ok": ("✓ OK", c["ok"]), "bad": ("✗ Damaged", c["bad"]), "other": ("• Other signal", c["other"])}
         self.brush = {k: pg.mkBrush(v[1]) for k, v in self.kind.items()}
-        if args.screenshot:                           # test runs must not change the user's saved choices
-            self.settings = QtCore.QSettings(os.path.join(tempfile.gettempdir(), "air-monitor-test.ini"),
-                                             QtCore.QSettings.Format.IniFormat)
+        if args.settings:                             # tests: their own file, never the user's saved choices
+            self.settings = QtCore.QSettings(args.settings, QtCore.QSettings.Format.IniFormat)
             self.settings.clear()
         else:
             self.settings = QtCore.QSettings("air-monitor", "air-monitor")
-        self.setWindowTitle("Air Monitor · 2440 MHz LoRa")
+        self.alerts_on = self.settings.value("alerts", not args.screenshot, type=bool)
+        self.mhz = f"{am.CH / 1e6:g} MHz"
+        self.row_s = am.BLOCK / am.FS                # one waterfall row per read (50 ms)
+        self.setWindowTitle(f"Air Monitor · {self.mhz} LoRa")
         self.q = mp.Queue(maxsize=400)
         self.worker = None
         self.csv = self.csv_key = None
         self.source = "demo" if args.demo else "file" if args.file else "hackrf"
         self.file = args.file
-        self.file_fc = args.file_fc * 1e6 if args.file else am.FC
+        self.file_fc = args.file_fc * 1e6 if args.file and args.file_fc else am.FC
         self.error, self.finished, self.worker_msg = None, False, ""
         self.rec_path = self.rec_t0 = None
         self.resize_due, self.last_resize = False, 0.0
         self.detail_widgets = []
+        self.session = self.last_session = None     # this listening session, and the last one that ended
+        self.alert = lh.LinkAlert()
+        self.waiting = False                        # waiting for the HackRF to come back
+        self.fb = None                              # "Find best" in progress
+        self.notice = None                          # (Status, until): a result shown for a few seconds
+        self.last_hist = 0.0
+        self.retry_proc = QtCore.QProcess(self)
+        self.retry_proc.finished.connect(self.hackrf_checked)
+        self.retry_timer = QtCore.QTimer(self)
+        self.retry_timer.setInterval(2000)
+        self.retry_timer.timeout.connect(self.check_hackrf)
         self.reset_stats()
         self.reset_run()
 
@@ -322,6 +375,7 @@ class Main(QtWidgets.QMainWindow):
         root.addLayout(self.build_header())
         self.status_card = StatusCard(c)
         self.status_card.fix.clicked.connect(self.fix_it)
+        self.status_card.link.clicked.connect(self.show_summary)
         root.addWidget(self.status_card)
         self.stack = QtWidgets.QStackedWidget()
         self.stack.addWidget(self.build_welcome())
@@ -406,6 +460,10 @@ class Main(QtWidgets.QMainWindow):
         self.act_rec = m.addAction("Record raw radio data")
         self.act_rec.setCheckable(True)
         self.act_rec.toggled.connect(self.record_toggled)
+        self.act_alert = m.addAction("Alert me when the link drops")
+        self.act_alert.setCheckable(True)
+        self.act_alert.setChecked(self.alerts_on)
+        self.act_alert.toggled.connect(self.alerts_toggled)
         m.addAction("Open logs folder").triggered.connect(self.open_logs)
         m.addAction("Clear").triggered.connect(self.clear)
         m.addSeparator()
@@ -421,7 +479,7 @@ class Main(QtWidgets.QMainWindow):
         v = QtWidgets.QVBoxLayout(box)
         v.setContentsMargins(28, 24, 28, 24)
         v.setSpacing(14)
-        v.addWidget(named(QtWidgets.QLabel("Watch your 2440 MHz LoRa link"), "headline"))
+        v.addWidget(named(QtWidgets.QLabel(f"Watch your {self.mhz} LoRa link"), "headline"))
         intro = named(QtWidgets.QLabel("Air Monitor listens with the HackRF and shows every packet your nodes "
                                        "send, as it happens."), "muted")
         intro.setWordWrap(True)
@@ -468,7 +526,7 @@ class Main(QtWidgets.QMainWindow):
         row.setSpacing(10)
         self.tiles = {}
         spec = [
-            ("ok", "Received", "LoRa packets read correctly (since the window opened, or since Clear).", False, 1),
+            ("ok", "Received", "LoRa packets read correctly since Start (or since Clear).", False, 1),
             ("bad", "Damaged", "LoRa packets that were heard but failed their check (CRC), so their content "
                                "can't be trusted.", False, 1),
             ("signal", "Signal", "How loud your nodes are at the HackRF: the loudest packet of the last 5 s "
@@ -479,9 +537,9 @@ class Main(QtWidgets.QMainWindow):
              True, 1),
             ("rate", "Packets / s", "Packets read correctly per second, over the last 5 s.", False, 0),
             ("other", "Other signals", "Bursts on the channel that are not LoRa: Wi-Fi, Bluetooth, microwave "
-                                       "ovens… (since the window opened).", False, 0),
+                                       "ovens… (since Start).", False, 0),
             ("interval", "Interval", "Time between the last two LoRa packets.", False, 0),
-            ("cfo", "Freq error", "How far the last packet's carrier was from 2440.0 MHz.", False, 0),
+            ("cfo", "Freq error", f"How far the last packet's carrier was from {am.CH / 1e6:.1f} MHz.", False, 0),
         ]
         for key, title, tooltip, bars, simple in spec:
             self.tiles[key] = Tile(title, tooltip, self.c, bars)
@@ -503,6 +561,7 @@ class Main(QtWidgets.QMainWindow):
         self.spec = plot(c, interactive=True)
         self.spec.showGrid(x=True, y=True, alpha=0.15)
         self.spec.setYRange(-110, -10)
+        self.spec.getAxis("left").setTicks([[(-20, "-20"), (-60, "-60"), (-100, "-100")]])
         self.spec.setXRange(f_mhz[0], f_mhz[-1], padding=0)
         self.spec.addItem(pg.LinearRegionItem((lo_ch, hi_ch), movable=False, brush=pg.mkBrush(46, 157, 79, 40),
                                               pen=pg.mkPen(None)))
@@ -525,6 +584,7 @@ class Main(QtWidgets.QMainWindow):
         wfw.setYRange(0, WF_ROWS, padding=0)
         wfw.getAxis("left").setTicks([[(WF_ROWS - 8, "now"), (WF_ROWS / 2, "5 s ago"), (12, "10 s ago")]])
         wfw.getAxis("left").setWidth(56)
+        wfw.setMinimumHeight(115)                     # the main picture: the other cards give way first
         edge = pg.mkPen(255, 255, 255, 170, width=1, style=Qt.PenStyle.DashLine)
         for x in (lo_ch, hi_ch):
             wfw.addItem(pg.InfiniteLine(x, angle=90, pen=edge, movable=False))
@@ -557,7 +617,9 @@ class Main(QtWidgets.QMainWindow):
         self.tl.getAxis("bottom").setTicks([[(-2, "2 s ago"), (-1.5, ""), (-1, "1 s ago"), (-0.5, ""),
                                              (0, "now")]])
         self.tl.getAxis("left").setWidth(56)
+        self.tl.setMinimumHeight(36)
         self.tl.setLabel("left", "dBFS")
+        self.tl.getAxis("left").setTicks([[(-20, "-20"), (-70, "-70")]])     # few labels: the card is short
         self.c_tl = self.tl.plot(pen=pg.mkPen("#3a8fd8", width=1))
         self.thr_line = pg.InfiniteLine(angle=0, pen=pg.mkPen("#e0a030", style=Qt.PenStyle.DashLine))
         self.tl.addItem(self.thr_line)
@@ -591,11 +653,31 @@ class Main(QtWidgets.QMainWindow):
         t.horizontalHeader().setHighlightSections(False)
         t.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.mono = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
+        # history: packets per second over the last 10 minutes
+        self.hist = plot(c)
+        self.hist.setMinimumHeight(32)
+        self.hist.showGrid(x=True, y=False, alpha=0.12)
+        self.hist.setXRange(-10.5, 0.4, padding=0)    # room for the edge labels
+        self.hist.setYRange(0, 1)
+        self.hist.getAxis("bottom").setTicks([[(-10, "10 min ago"), (-7.5, ""), (-5, "5 min ago"), (-2.5, ""),
+                                               (0, "now")]])
+        self.hist.getAxis("left").setWidth(56)
+        self.hist.getAxis("left").setStyle(showValues=False)    # the shape matters; the rate is in the status
+        self.c_hist = self.hist.plot(pen=pg.mkPen(c["accent"], width=1.5))
+        self.hist_lost = pg.ScatterPlotItem(size=7, pen=None, brush=pg.mkBrush(c["bad"]))
+        self.hist.addItem(self.hist_lost)
+        f, v = card("History", "last 10 min · packets per second · red = packets lost")
+        f.setToolTip(tip("How the link has been doing: packets read per second, in 5 s steps. A drop to zero "
+                         "means nothing was heard; red dots mark moments when packets were lost."))
+        v.addWidget(self.hist, 1)
+        split.addWidget(f)
+
         f, v = card("Messages", "newest first")
         v.addWidget(t, 1)
         split.addWidget(f)
-        split.setSizes([180, 320, 150, 260])
-        for i, s in enumerate((2, 4, 2, 3)):
+        t.setMinimumHeight(48)
+        split.setSizes([180, 360, 130, 100, 230])
+        for i, s in enumerate((2, 4, 2, 1, 3)):
             split.setStretchFactor(i, s)
         return split
 
@@ -621,6 +703,13 @@ class Main(QtWidgets.QMainWindow):
             seg.addWidget(b)
         self.sens.buttonClicked.connect(lambda b: self.set_gain(*lh.SENSITIVITY[b.text()]))
         bar.addLayout(seg)
+        self.find_btn = QtWidgets.QPushButton("Find best")
+        self.find_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.find_btn.setToolTip(tip("Tries Low, Normal and High for a few seconds each, and keeps the one that "
+                                     "loses the fewest packets without overloading the HackRF. Takes about 15 s; "
+                                     "a node must be transmitting."))
+        self.find_btn.clicked.connect(self.find_best)
+        bar.addWidget(self.find_btn)
         self.custom_lbl = named(QtWidgets.QLabel(), "hint")
         bar.addWidget(self.custom_lbl)
 
@@ -641,6 +730,10 @@ class Main(QtWidgets.QMainWindow):
         self.detail_widgets.append(raw)
         bar.addWidget(raw)
         bar.addStretch(1)
+        radio = named(QtWidgets.QLabel(f"Radio: {am.RADIO.label()}"), "hint")
+        radio.setToolTip(tip("The nodes' radio settings. Change them in air-monitor.toml (see the README)."))
+        self.detail_widgets.append(radio)
+        bar.addWidget(radio)
         self.health = named(QtWidgets.QLabel(), "hint")
         self.health.setToolTip(tip("Receiver health: input sample rate, 50 ms blocks dropped because the "
                                    "computer fell behind, and data waiting to be processed."))
@@ -657,6 +750,7 @@ class Main(QtWidgets.QMainWindow):
     # ----- state
     def reset_stats(self):
         self.count = {"ok": 0, "bad": 0, "other": 0}
+        self.seqs = payloads.SequenceTracker()      # lost packets, from the nodes' packet counters
 
     def reset_run(self):
         """State that belongs to one run of the receiver (its stream time starts at 0)."""
@@ -670,6 +764,10 @@ class Main(QtWidgets.QMainWindow):
         self.rate, self.dropped, self.backlog = None, 0, 0
         self.drop_seen = -1e9
         self.run_t0 = time.time()
+        self.seqs.new_run()                         # don't count the packets missed while restarting as lost
+        self.alert.reset()                          # ... nor take the restart for a dropped link
+        if self.session:
+            self.session.new_run()
         if hasattr(self, "marks"):
             self.marks.clear()
             self.c_tl.setData([], [])
@@ -685,6 +783,10 @@ class Main(QtWidgets.QMainWindow):
         self.last_lora = None
         for t in self.tiles.values():
             t.set("–")
+        if self.session:                            # "since Clear": the session starts again too
+            self.session = Session(self.source_label(), time.time())
+        self.c_hist.setData([], [])
+        self.hist_lost.clear()
         self.refresh()
 
     def gains(self):
@@ -707,14 +809,16 @@ class Main(QtWidgets.QMainWindow):
             self.settings.setValue("lna", lna)
             self.settings.setValue("vga", vga)
         if restart and self.worker and self.source == "hackrf":
-            self.stop()
-            self.start()
+            self.restart()
 
     def gain_widgets_changed(self, *_):
         self.set_gain(*self.gains())
 
     def fix_it(self):
         st = self.status
+        if st.action == "cancel":
+            self.cancel_find_best()
+            return
         name = lh.step_sensitivity(*self.gains(), -1 if st.action == "lower" else +1) if st.action else None
         if name:
             self.set_gain(*lh.SENSITIVITY[name])
@@ -739,10 +843,12 @@ class Main(QtWidgets.QMainWindow):
         self.resize_due = True
         self.tile_refresh()
 
+    def source_label(self):
+        return {"hackrf": "live from the HackRF", "demo": "demo recording (no HackRF needed)",
+                "file": f"recording {os.path.basename(self.file or '')}"}[self.source]
+
     def update_subtitle(self):
-        src = {"hackrf": "live from the HackRF", "demo": "demo recording (no HackRF needed)",
-               "file": f"recording {os.path.basename(self.file or '')}"}[self.source]
-        self.subtitle.setText(f"2440 MHz · LoRa · {src}")
+        self.subtitle.setText(f"{self.mhz} · LoRa · {self.source_label()}")
         self.subtitle.setToolTip(self.worker_msg)
         for key, a in self.act_src.items():
             a.setChecked(key == self.source)
@@ -750,19 +856,21 @@ class Main(QtWidgets.QMainWindow):
     def update_controls(self):
         live = self.source == "hackrf"
         for w in self.sens.buttons() + [self.lna, self.vga]:
-            w.setEnabled(live)
+            w.setEnabled(live and self.fb is None)
+        self.find_btn.setEnabled(live and self.fb is None)
         name = lh.preset_name(*self.gains())
         self.custom_lbl.setText("only for the live HackRF" if not live else
                                 "" if name else "Custom (LNA {}, VGA {})".format(*self.gains()))
         self.act_rec.setEnabled(live and self.worker is not None)
-        self.btn.setText("■  Stop" if self.worker else "▶  Start")
+        busy = self.worker is not None or self.waiting or self.fb is not None
+        self.btn.setText("■  Stop" if busy else "▶  Start")
 
     # ----- sources and running
     def use_source(self, source, path=None):
+        self.stop(end_session=True)
         self.source = source
         if path:
             self.file, self.file_fc = path, am.FC
-        self.stop()
         self.update_subtitle()
         self.start()
 
@@ -775,16 +883,23 @@ class Main(QtWidgets.QMainWindow):
             self.update_subtitle()                     # put the tick back on the current source
 
     def toggle(self):
-        if self.worker:
-            self.stop()
+        if self.worker or self.waiting or self.fb:
+            self.stop(end_session=True)
         else:
             self.start()
 
-    def start(self):
+    def restart(self):
+        """Restart the receiver (e.g. new gains) in the same session."""
+        self.stop()
+        self.start(new_session=False)
+
+    def start(self, new_session=True):
         if self.worker:
             return
         self.error, self.finished, self.worker_msg = None, False, ""
         self.stack.setCurrentIndex(1)
+        if new_session or self.session is None:
+            self.begin_session()
         if self.source == "hackrf" and shutil.which("hackrf_transfer") is None:
             self.error = "hackrf_transfer: not installed (not found on the PATH)"
             self.refresh()
@@ -798,14 +913,181 @@ class Main(QtWidgets.QMainWindow):
         self.update_controls()
         self.refresh()
 
-    def stop(self):
+    def stop(self, end_session=False):
+        """Stop the receiver. end_session: the user is done (Stop, another source, end of a recording, closing):
+        also stop waiting or searching, and wrap up the session summary."""
         if self.rec_path:
             self.set_record(False)
         if self.worker:
             self.worker.stop()
             self.worker = None
+        if end_session:
+            self.stop_waiting()
+            if self.fb:
+                self.cancel_find_best(restart=False)
+            self.finish_session()
         self.update_controls()
         self.refresh()
+
+    # ----- sessions
+    def begin_session(self):
+        self.finish_session()
+        self.reset_stats()
+        self.session = Session(self.source_label(), time.time())
+        self.last_session = None
+        self.c_hist.setData([], [])
+        self.hist_lost.clear()
+
+    def finish_session(self):
+        """End the session: keep it for the status line and 'View summary', and save the summary beside the
+        packet log (not for the demo)."""
+        s, self.session = self.session, None
+        if s is None or not s.active:
+            return
+        s.end = time.time()
+        if self.csv and self.csv_key and self.csv_key[0] == self.source:
+            s.log_path = os.path.relpath(self.csv_path, os.path.dirname(am.LOGS))
+        s.summary_path = None
+        if self.source != "demo":
+            path = os.path.join(am.LOGS, f"air_{datetime.datetime.fromtimestamp(s.start):%Y%m%d_%H%M%S}"
+                                         f".summary.txt")
+            try:
+                os.makedirs(am.LOGS, exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(s.summary_text(s.end))
+                s.summary_path = path
+            except OSError:
+                pass
+        self.last_session = s
+
+    def show_summary(self):
+        s = self.last_session
+        if s is None:
+            return
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Session summary")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        rows = "".join(f"<tr><td style='padding-right:16px; color:{self.c['muted']}'>{html.escape(k)}</td>"
+                       f"<td>{html.escape(v)}</td></tr>" for k, v in s.summary(s.end))
+        box.setText(f"<table>{rows}</table>")
+        folder = None
+        if s.summary_path:
+            box.setInformativeText(f"Saved as {os.path.relpath(s.summary_path, os.path.dirname(am.LOGS))}")
+            folder = box.addButton("Open logs folder", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QtWidgets.QMessageBox.StandardButton.Close)
+        box.exec()
+        if folder is not None and box.clickedButton() is folder:
+            self.open_logs()
+
+    def update_history(self, now):
+        h = self.session.history(now) if self.session else []
+        self.last_hist = now
+        if not h:
+            return
+        x, y = [p[0] for p in h], [p[1] for p in h]
+        self.c_hist.setData(x, y)
+        self.hist_lost.setData([p[0] for p in h if p[2]], [p[1] for p in h if p[2]])
+        self.hist.setYRange(0, max(1.0, max(y) * 1.25), padding=0)
+
+    def gain_label(self):
+        """The sensitivity, as the session summary lists it (live HackRF only)."""
+        if self.source != "hackrf":
+            return ""
+        lna, vga = self.gains()
+        return f"{lh.preset_name(lna, vga) or 'Custom'} (LNA {lna}, VGA {vga})"
+
+    def alerts_toggled(self, on):
+        self.alerts_on = on
+        self.settings.setValue("alerts", on)
+
+    # ----- waiting for the HackRF to come back
+    def on_error(self, raw):
+        """The receiver stopped with an error. If the HackRF can come back by itself (unplugged, busy, USB
+        hiccup), wait for it and carry on in the same session; else end the session."""
+        self.stop()
+        self.error = raw
+        if self.source == "hackrf" and lh.should_retry(raw):
+            if self.fb:                                # can't finish the search: put the old gains back
+                fb, self.fb = self.fb, None
+                self.set_gain(*fb["prev"], save=False, restart=False)
+            if self.alerts_on and self.alert.state == "up":
+                notify(self, "The HackRF stopped", "Listening starts again by itself when it's back.")
+            self.alert.reset()
+            self.waiting = True
+            self.retry_timer.start()
+            self.update_controls()
+        else:
+            self.stop(end_session=True)
+
+    def stop_waiting(self):
+        self.waiting = False
+        self.retry_timer.stop()
+        if self.retry_proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+            self.retry_proc.kill()
+
+    def check_hackrf(self):
+        if self.worker is None and self.retry_proc.state() == QtCore.QProcess.ProcessState.NotRunning:
+            self.retry_proc.start("hackrf_info", [])
+
+    def hackrf_checked(self, *_):
+        out = (bytes(self.retry_proc.readAllStandardOutput()) +
+               bytes(self.retry_proc.readAllStandardError())).decode(errors="replace")
+        if self.waiting and "Found HackRF" in out and "busy" not in out.lower():
+            self.stop_waiting()
+            self.start(new_session=False)
+
+    # ----- "Find best": try each sensitivity for a few seconds, keep the best
+    def find_best(self):
+        if self.source != "hackrf" or self.fb or self.waiting:
+            return
+        if not self.worker:
+            self.start()
+        self.notice = None
+        self.fb = dict(names=list(lh.ORDER), i=-1, prev=self.gains(), trials={}, phase=None, t=0.0, cur=None)
+        self.fb_next()
+
+    def fb_next(self):
+        fb = self.fb
+        if fb["cur"] is not None:
+            c = fb["cur"]
+            fb["trials"][fb["names"][fb["i"]]] = dict(
+                ok=c["ok"], bad=c["bad"], not_heard=c["not_heard"], peak=max(c["levels"], default=None),
+                snr=statistics.median(c["snrs"]) if c["snrs"] else None)
+        fb["i"] += 1
+        if fb["i"] == len(fb["names"]):
+            self.fb_finish()
+            return
+        fb["cur"] = dict(ok=0, bad=0, not_heard=0, levels=[], snrs=[])
+        fb["phase"], fb["t"] = "settle", time.time()
+        self.set_gain(*lh.SENSITIVITY[fb["names"][fb["i"]]], save=False)     # restarts the receiver
+        self.update_controls()
+
+    def fb_tick(self):
+        fb, now = self.fb, time.time()
+        if fb["phase"] == "settle":
+            if self.have_data and now - fb["t"] >= 1.0:
+                fb["phase"], fb["t"] = "measure", now
+            elif now - fb["t"] > 8.0:                  # no data from the HackRF: counts as nothing heard
+                self.fb_next()
+        elif fb["phase"] == "measure" and now - fb["t"] >= MEASURE_S:
+            self.fb_next()
+
+    def fb_finish(self):
+        fb, self.fb = self.fb, None
+        name, why = lh.pick_sensitivity(fb["trials"])
+        if name:
+            self.set_gain(*lh.SENSITIVITY[name])
+            self.notice = (lh.Status("ok", f"Sensitivity set to {name}", why, None), time.time() + 15)
+        else:
+            self.set_gain(*fb["prev"], save=False)
+            self.notice = (lh.Status("warn", "Kept the sensitivity as it was", why, None), time.time() + 15)
+        self.update_controls()
+
+    def cancel_find_best(self, restart=True):
+        fb, self.fb = self.fb, None
+        if fb:
+            self.set_gain(*fb["prev"], save=False, restart=restart)
+        self.update_controls()
 
     def open_csv(self):
         """One packet log per source, opened at its first packet (the demo is not logged)."""
@@ -816,10 +1098,10 @@ class Main(QtWidgets.QMainWindow):
             self.csv_f.close()
         os.makedirs(am.LOGS, exist_ok=True)
         path = os.path.join(am.LOGS, f"air_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv")
-        self.csv_f = open(path, "w", newline="", buffering=1)
+        self.csv_f = open(path, "w", newline="", buffering=1, encoding="utf-8")
         self.csv = csv.writer(self.csv_f)
         self.csv.writerow(["time", "stream_s", "type", "dt_ms", "dur_ms", "level_dbfs", "snr_db", "freq_err_khz",
-                           "len", "header_ok", "crc_ok", "sync", "payload_hex", "text"])
+                           "len", "header_ok", "crc_ok", "sync", "payload_hex", "text", "seq"])
         self.csv_key, self.csv_path = key, path
 
     # ----- recording raw IQ
@@ -868,23 +1150,29 @@ class Main(QtWidgets.QMainWindow):
             "what to do.</p>"
             "<p><b>What's on the air</b>: a waterfall. Each row is 50 ms of radio, newest at the top, and "
             "brighter means stronger. The dashed lines mark your LoRa channel: every packet is a bright bar "
-            "between them, with a dot beside it: green = read OK, red = damaged, grey = some other signal "
+            "between them, with a tick beside it: green = read OK, red = damaged, grey = some other signal "
             "(Wi-Fi, Bluetooth…).</p>"
             "<p><b>Packets</b>: the last 2 seconds of the channel. Each spike is one transmission; evenly "
             "spaced spikes are the nodes taking turns.</p>"
-            "<p><b>Received / Damaged</b>: how many packets were read correctly or failed their check. "
-            "<b>Signal</b>: how loud the nodes are at the HackRF. <b>Quality</b>: how clearly they stand out "
-            "from the noise.</p>"
-            "<p><b>Messages</b>: what each packet said, newest first.</p>"
-            "<p><b>Sensitivity</b>: Normal suits most cases. If the status says the signal is too strong, "
-            "pick Low (or press the button in the status line); if it is weak, pick High.</p>"
+            "<p><b>History</b>: packets per second over the last 10 minutes; red dots mark lost packets.</p>"
+            "<p><b>Received / Lost</b>: packets read correctly, and the share that did not arrive intact (worked "
+            "out from the nodes' packet numbers; for other nodes this tile shows <b>Damaged</b>: packets that "
+            "failed their check). <b>Signal</b>: how loud the nodes are at the HackRF. <b>Quality</b>: how "
+            "clearly they stand out from the noise.</p>"
+            "<p><b>Messages</b>: what each packet said, newest first (the v0.1 nodes send a packet number).</p>"
+            "<p><b>Sensitivity</b>: Normal suits most cases. If the status says the signal is too strong, pick "
+            "Low (or press the button in the status line); if it is weak, pick High. <b>Find best</b> tries all "
+            "three and keeps the best.</p>"
+            "<p>After <b>Stop</b>, the status line sums up the session; <b>View summary</b> shows all the "
+            "numbers (also saved next to the packet log). If the HackRF is unplugged, listening starts again "
+            "by itself when it is back.</p>"
             "<p><b>Show details</b>: the spectrum, the raw gains and the technical columns, for experts.</p>"
             "<p>Hover over anything to see what it means. Space starts and stops listening.</p>")
         box.exec()
 
     def closeEvent(self, e):
         self.settings.setValue("geometry", self.saveGeometry())
-        self.stop()
+        self.stop(end_session=True)
         super().closeEvent(e)
 
     # ----- updates
@@ -902,11 +1190,10 @@ class Main(QtWidgets.QMainWindow):
                 self.worker_msg = val
                 self.update_subtitle()
             elif kind == "done":
-                self.stop()
+                self.stop(end_session=True)
                 self.finished = True
             elif kind == "error":
-                self.stop()
-                self.error = val
+                self.on_error(val)
         if last is not None:
             self.draw(last)
         self.refresh()
@@ -945,14 +1232,14 @@ class Main(QtWidgets.QMainWindow):
             if m:
                 self.c_tl.setData(t[:m].reshape(-1, 4)[:, 0], d[:m].reshape(-1, 4).max(axis=1))
             self.thr_line.setValue(last["thr_db"])
-        self.mark_pts = [p for p in self.mark_pts if p[0] > self.now - WF_ROWS * ROW_S]
+        self.mark_pts = [p for p in self.mark_pts if p[0] > self.now - WF_ROWS * self.row_s]
         strip = [p for p in self.mark_pts if p[0] > self.now - TL_S]
         self.marks.setData([p[0] - self.now for p in strip], [p[1] for p in strip],
                            brush=[self.brush[p[2]] for p in strip])
         lane = np.zeros((1, WF_ROWS, 4), np.ubyte)               # [x, y, rgba], y = 0 at the bottom (10 s ago)
         for kind in ("other", "ok", "bad"):                        # damaged last, so it is never hidden
             for t, _, k in self.mark_pts:
-                row = WF_ROWS - 1 - int((self.now - t) / ROW_S)
+                row = WF_ROWS - 1 - int((self.now - t) / self.row_s)
                 if k == kind and 0 <= row < WF_ROWS:
                     lane[0, row] = self.lane_rgba[k]
         self.lane.setImage(lane, autoLevels=False)
@@ -966,28 +1253,45 @@ class Main(QtWidgets.QMainWindow):
         if kind != "other":
             self.last_lora = pk
             self.ever_lora = True
+        d = payloads.describe(pk["data"])
+        not_heard = 0
+        if kind == "ok" and d.seq is not None:
+            _, not_heard = self.seqs.good(d.stream, d.seq)
+            self.recent.extend((pk["stream_s"], "missed", None, None) for _ in range(not_heard))
+        elif kind == "bad":
+            self.seqs.bad()
+        if self.session:
+            self.session.add(pk["wall"], kind, pk["level_db"], pk["snr_db"], self.gain_label(), not_heard,
+                             counter=d.seq is not None)
+        if self.fb and self.fb["phase"] == "measure" and kind != "other":
+            cur = self.fb["cur"]
+            cur[kind] += 1
+            cur["not_heard"] += not_heard
+            cur["levels"].append(pk["level_db"])
+            cur["snrs"].append(pk["snr_db"])
         text = "".join(chr(b) if 32 <= b < 127 else "." for b in pk["data"])
         fmt = lambda v, f: "" if v is None else format(v, f)                       # noqa: E731
         if kind != "other" or self.args.show_other:
-            self.add_row(pk, text, fmt)
+            self.add_row(pk, d, fmt)
         self.open_csv()
         if self.csv and self.source != "demo":
             self.csv.writerow([datetime.datetime.fromtimestamp(pk["wall"]).isoformat(timespec="milliseconds"),
                                f"{pk['stream_s']:.6f}", kind, fmt(pk["dt_ms"], ".3f"),
                                fmt(pk["dur_ms"], ".3f"), f"{pk['level_db']:.1f}", f"{pk['snr_db']:.1f}",
                                fmt(pk["cfo_khz"], ".2f"), fmt(pk["length"], "d"), pk["header_ok"],
-                               pk["crc_ok"], pk["sync"], pk["data"].hex(), text])
+                               pk["crc_ok"], pk["sync"], pk["data"].hex(), text,
+                               "" if kind != "ok" or d.seq is None else d.seq])
 
-    def add_row(self, pk, text, fmt):
+    def add_row(self, pk, d, fmt):
         kind = pk["kind"]
         label, color = self.kind[kind]
-        is_text = True
+        style = "text"
         if kind == "other":
             msg = "Not LoRa (Wi-Fi, Bluetooth…)"
         elif not pk["data"]:
             msg = "(empty)" if kind == "ok" else "Couldn't read this packet"
         else:
-            msg, is_text = lh.payload_text(pk["data"])
+            msg, style = d.shown, d.style
         quality = "" if kind == "other" else lh.quality_rating(pk["snr_db"]).word
         crc = "" if pk["crc_ok"] is None else ("ok" if pk["crc_ok"] and pk["header_ok"] else "BAD")
         row = [datetime.datetime.fromtimestamp(pk["wall"]).strftime("%H:%M:%S.%f")[:-3], label, quality, msg,
@@ -1000,12 +1304,14 @@ class Main(QtWidgets.QMainWindow):
                 it.setForeground(QtGui.QColor(color))
             elif i in (2, 3) and kind != "ok":
                 it.setForeground(QtGui.QColor(self.c["muted"]))
-            if i == 11 or (i == 3 and not is_text):
+            if i == 11 or (i == 3 and style == "hex"):
                 it.setFont(self.mono)
             if i == 3 and kind == "bad":
                 it.setToolTip("Damaged packet: this content may be wrong.")
-            elif i == 3 and not is_text:
-                it.setToolTip("Binary data (not text), shown as bytes in hex.")
+            elif i == 3:
+                it.setToolTip({"hex": "Binary data (not text), shown as bytes in hex.",
+                               "counter": "The node's packet number. Gaps in the numbers are counted as lost "
+                                          "packets."}.get(style, ""))
             self.table.setItem(0, i, it)
         if self.table.rowCount() > MAX_ROWS:
             self.table.removeRow(MAX_ROWS)
@@ -1020,14 +1326,37 @@ class Main(QtWidgets.QMainWindow):
     def refresh(self):
         while self.recent and self.recent[0][0] < self.now - lh.WINDOW_S:
             self.recent.popleft()
+        if self.fb:
+            self.fb_tick()
         starting = {"hackrf": "Waking up the HackRF…", "demo": "Preparing the demo…",
                     "file": "Opening the recording…"}[self.source]
         self.status = lh.link_status(running=self.worker is not None, have_data=self.have_data, error=self.error,
                                      finished=self.finished, recent=list(self.recent), now=self.now,
                                      ever_lora=self.ever_lora, data_lost=self.data_lost(),
                                      can_tune=self.source == "hackrf", lna=self.gains()[0], vga=self.gains()[1],
-                                     starting=self.worker_msg or starting)
-        self.status_card.set(self.status, tech=self.error)
+                                     starting=self.worker_msg or starting,
+                                     loss_pct=self.seqs.loss_pct if self.seqs.active else None)
+        now, link = time.time(), None
+        if self.waiting:
+            self.status = lh.waiting_status(self.error)
+        elif self.fb:
+            fb = self.fb
+            self.status = lh.Status("idle", "Finding the best sensitivity…",
+                                    f"Trying {fb['names'][fb['i']]} ({fb['i'] + 1} of {len(fb['names'])}). "
+                                    f"This takes about 15 s.", "cancel")
+        elif self.notice and now < self.notice[1] and self.worker:
+            self.status = self.notice[0]
+        elif self.worker is None and not self.error and self.last_session:
+            self.status = self.status._replace(detail=self.last_session.one_line(now))
+            link = "View summary"
+        self.status_card.set(self.status, tech=self.error, link=link)
+        if self.worker and self.have_data and not self.fb:
+            event = self.alert.update(now, any(r[1] == "ok" for r in self.recent))
+            if event and self.alerts_on:
+                notify(self, *{"dropped": ("LoRa link dropped", "No packets from your nodes for 5 s."),
+                               "back": ("LoRa link is back", "Packets are arriving again.")}[event])
+        if self.session and now - self.last_hist >= 1.0:
+            self.update_history(now)
         self.status_card.setVisible(self.stack.currentIndex() == 1 or bool(self.error))
         self.tile_refresh()
         if self.rec_path:
@@ -1060,7 +1389,17 @@ class Main(QtWidgets.QMainWindow):
             return
         c, T = self.c, self.tiles
         T["ok"].set(str(self.count["ok"]), c["ok"] if self.count["ok"] else None)
-        T["bad"].set(str(self.count["bad"]), c["bad"] if self.count["bad"] else None)
+        if self.seqs.active:                        # the packets carry a counter: show what was lost
+            pct, level = self.seqs.loss_pct, lh.loss_level(self.seqs.loss_pct)
+            T["bad"].set_title("Lost", "Packets the nodes sent that did not arrive intact, worked out from their "
+                                       "packet numbers: damaged (heard, but failed the check) plus not heard at "
+                                       "all. Since Start (or since Clear).")
+            T["bad"].set(f"{pct:.1f} %", c[level], caption=f"{self.seqs.damaged} damaged · "
+                                                           f"{self.seqs.not_heard} not heard")
+        else:
+            T["bad"].set_title("Damaged", "LoRa packets that were heard but failed their check (CRC), so their "
+                                          "content can't be trusted.")
+            T["bad"].set(str(self.count["bad"]), c["bad"] if self.count["bad"] else None)
         T["other"].set(str(self.count["other"]))
         n_ok = sum(1 for r in self.recent if r[1] == "ok")
         T["rate"].set(f"{n_ok / min(lh.WINDOW_S, max(self.now, 1.0)):.1f}" if self.have_data else "–")
@@ -1090,15 +1429,24 @@ class Main(QtWidgets.QMainWindow):
         T["cfo"].set("–" if pk["cfo_khz"] is None else f"{pk['cfo_khz']:+.1f} kHz")
 
 
-def run(args):
-    app = QtWidgets.QApplication(sys.argv)
+def setup_app(app, theme=None):
+    """Apply the light or dark theme (default: follow the system) and return its colours."""
     app.setApplicationName("Air Monitor")
-    dark = args.theme == "dark" if getattr(args, "theme", None) else is_dark(app)
-    c = DARK if dark else LIGHT
+    c = (DARK if theme == "dark" else LIGHT) if theme else DARK if is_dark(app) else LIGHT
     app.setStyle("Fusion")
     app.setPalette(palette(c))
     app.setStyleSheet(stylesheet(c))
     pg.setConfigOptions(antialias=False, background=c["card"], foreground=c["muted"])
+    return c
+
+
+def run(args):
+    if getattr(args, "radio", None) is not None:
+        am.configure(args.radio)                  # the receiver module this window (and its Worker) uses
+    app = QtWidgets.QApplication(sys.argv)
+    c = setup_app(app, args.theme)
+    if args.screenshot and not args.settings:     # screenshot runs must not change the user's saved choices
+        args.settings = os.path.join(tempfile.gettempdir(), "air-monitor-test.ini")
     w = Main(args, c)
     w.show()
     if args.file or args.demo or args.autostart:

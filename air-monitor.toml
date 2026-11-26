@@ -1,0 +1,8 @@
+# Air Monitor: the radio settings of the nodes.
+# These are the v0.1 firmware settings (the same as having no file). Change them here when the nodes change.
+
+[radio]
+frequency_mhz = 2440.0      # channel centre, 2400-2500
+spreading_factor = 7        # 7-10
+bandwidth_khz = 1625        # 1625, 812.5, 406.25 or 203.125
+coding_rate = 5             # 5-8, for 4/5 to 4/8

@@ -7,6 +7,7 @@ whole number of 50 ms reads long, so it can loop without a seam.
 
     python3 tools/demo_capture.py [OUT.iq]          # default: a cached file in the temp folder
 """
+import math
 import os
 import sys
 import tempfile
@@ -17,26 +18,47 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import air_monitor as am  # noqa: E402  (FS, OFFSET, BLOCK)
 import lora_phy as phy  # noqa: E402
 
-VERSION = 1                       # bump when the content changes, so cached files are rebuilt
-SECONDS = 2.0                     # loop length
-FRAME_S = 0.25                    # each node sends once per frame, in its own slot
+VERSION = 2                       # bump when the content changes, so cached files are rebuilt
+REF_FRAME_S = 0.25                # at the default settings each node sends once per 250 ms frame,
+FRAMES = 8                        # for 8 frames: a 2 s loop. Slow settings stretch the frames (see timing()).
+SLOT_FIT_S = 0.02                 # stretch the frames when a packet is on the air longer than this
 NOISE = 1.5 / 128                 # receiver noise, per I/Q component (full scale = 1)
 NODES = [                         # slot start (s), amplitude (full scale = 1), message
     (0.020, 0.12, "node-1 temp {:.1f} C"),
     (0.100, 0.05, "node-2 hum {:.0f} %"),
     (0.180, 0.025, "node-3 batt {:.2f} V"),
 ]
-BAD = (5, 2)                      # (frame, node) whose packet is corrupted
+BAD = (5, 2)                      # (frame, node) whose packet is corrupted (last frame if there are fewer)
 WIFI = [(1, 0.060, 0.0025), (4, 0.065, 0.0015), (6, 0.058, 0.0030)]       # (frame, offset s, length s)
 BT = [(0, 0.140, -1.5e6), (2, 0.145, 3.0e6), (3, 0.150, -1.5e6), (5, 0.140, 3.0e6), (7, 0.142, -1.0e6)]
 
 
 def default_path():
-    return os.path.join(tempfile.gettempdir(), f"air_monitor_demo_v{VERSION}.iq")
+    r = am.RADIO
+    return os.path.join(tempfile.gettempdir(),
+                        f"air_monitor_demo_v{VERSION}_sf{r.sf}_bw{r.bw}_cr{r.cr}.iq")
+
+
+def packet_s():
+    """Air time of one 20-byte demo packet at the current radio settings."""
+    return (phy.PREAMBLE + 4.25 + len(phy.encode_symbols(bytes(20)))) * phy.N / phy.BW
+
+
+def timing():
+    """(frame_s, frames, bad_frame). Slow settings (long packets) stretch the frames so the packets still fit
+    their slots, and use fewer frames so the file stays small. The default settings give (0.25, 8, 5)."""
+    scale = max(1.0, packet_s() / SLOT_FIT_S)
+    frames = max(3, min(FRAMES, round(FRAMES / scale)))
+    return REF_FRAME_S * scale, frames, min(BAD[0], frames - 1)
+
+
+def seconds():
+    frame_s, frames, _ = timing()
+    return frame_s * frames
 
 
 def n_samples():
-    return int(round(SECONDS * am.FS / am.BLOCK)) * am.BLOCK
+    return int(math.ceil(seconds() * am.FS / am.BLOCK - 1e-9)) * am.BLOCK
 
 
 def _band_noise(rng, n, f0, width, amp):
@@ -53,24 +75,27 @@ def build():
     n = n_samples()
     x = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) * NOISE
     shift = 2 * np.pi * am.OFFSET / am.FS
-    for fr in range(int(SECONDS / FRAME_S)):
-        t0 = fr * FRAME_S
+    frame_s, frames, bad_frame = timing()
+    scale = frame_s / REF_FRAME_S
+    for fr in range(frames):
+        t0 = fr * frame_s
         for k, (slot, amp, msg) in enumerate(NODES):
             value = (21.5 + 0.1 * fr, 48 + fr % 3, 3.92 - 0.01 * fr)[k]
             syms = phy.encode_symbols(msg.format(value).ljust(20).encode())
-            if (fr, k) == BAD:
-                syms[15] = (syms[15] + 37) % phy.N          # a damaged payload symbol: CRC fails
+            if (fr, k) == (bad_frame, BAD[1]):
+                syms[8] = (syms[8] + 37) % phy.N            # first payload symbol (data bits at any
+                #                                             coding rate) damaged: the CRC fails
             # conjugated, then moved up to the channel: see lora_phy.read_iq and the encode command
             z = np.conj(np.array(phy.modulate(syms, am.FS), np.complex128))
-            i = int((t0 + slot) * am.FS)
+            i = int((t0 + slot * scale) * am.FS)
             x[i:i + len(z)] += amp * z * np.exp(1j * shift * (i + np.arange(len(z))))
         for f, off, length in WIFI:                          # wideband bursts across the whole view
             if f == fr:
-                i, m = int((t0 + off) * am.FS), int(length * am.FS)
+                i, m = int((t0 + off * scale) * am.FS), int(length * am.FS)
                 x[i:i + m] += _band_noise(rng, m, 0.0, 6.0e6, 0.08)
         for f, off, f0 in BT:                                # short narrow hops, outside the LoRa channel
             if f == fr:
-                i, m = int((t0 + off) * am.FS), int(0.0004 * am.FS)
+                i, m = int((t0 + off * scale) * am.FS), int(0.0004 * am.FS)
                 x[i:i + m] += _band_noise(rng, m, f0, 1.0e6, 0.05)
     iq = np.empty(2 * n, np.int8)
     iq[0::2] = np.clip(np.round(x.real * 128), -127, 127)
