@@ -1,16 +1,20 @@
 """What the nodes' packets say, for the Messages list, and how many packets were lost.
 
-The v0.1 nodes send 3 bytes: 0xA5, then a 16-bit packet counter, low byte first (seen on the bench, 25-11-2026:
-a5 d7 08, a5 d8 08, ... one every 97 ms). Gaps in that counter tell exactly how many packets did not arrive
-intact. Any other payload is shown as text when it reads as text, else as hex.
+The v0.1 nodes start every packet with a type byte, 0xA4 or 0xA5, then a 16-bit packet counter, low byte first,
+then the data (seen on the bench): 3-byte beacons every 97 ms (a5 d7 08, a5 d8 08, ...) and longer data packets
+(a4 c7 02 fd 1c ..., 140-199 bytes, 26-11-2026), all numbered from the same counter. Gaps in that counter tell
+exactly how many packets did not arrive intact. Any other payload is shown as text when it reads as text, else as
+hex.
 """
 import collections
 
-COUNTER_MAGIC = 0xA5        # first byte of a counter packet (counted per first byte, in case it is a node ID)
+COUNTER_TYPES = (0xA4, 0xA5)  # first byte of a v0.1 packet; both types share one counter
 RESTART_JUMP = 1000         # a counter that goes back, or jumps further than this, means the node restarted
 
 Described = collections.namedtuple("Described", "shown seq stream style")
-# style: "counter" ("Packet #2263"), "text", or "hex" (binary, shown as bytes)
+# style: "counter" ("Packet #2263", "Packet #711 · 137 bytes"), "text", or "hex" (binary, shown as bytes)
+# stream: which counter the seq belongs to (one per node; the v0.1 packets don't say which node sent them, so
+# all of them count as one stream)
 
 
 def text_or_hex(data):
@@ -24,9 +28,10 @@ def text_or_hex(data):
 
 def describe(data):
     data = bytes(data)
-    if len(data) == 3 and data[0] == COUNTER_MAGIC:
+    if len(data) >= 3 and data[0] in COUNTER_TYPES:
         seq = data[1] | data[2] << 8
-        return Described(f"Packet #{seq}", seq, data[0], "counter")
+        extra = f" · {len(data) - 3} bytes" if len(data) > 3 else ""
+        return Described(f"Packet #{seq}{extra}", seq, "v0.1", "counter")
     shown, is_text = text_or_hex(data)
     return Described(shown, None, None, "text" if is_text else "hex")
 

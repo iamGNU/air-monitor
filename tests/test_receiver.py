@@ -84,6 +84,58 @@ class DemoDecode(unittest.TestCase):
             self.assertEqual(p["data"], b"")
 
 
+def capture(packets, seconds):
+    """int8 IQ like the HackRF's: (start_s, payload, amplitude) packets over the demo's receiver noise."""
+    import numpy as np
+    import lora_phy as phy
+    rng = np.random.default_rng(3)
+    n = int(np.ceil(seconds * am.FS / am.BLOCK)) * am.BLOCK
+    x = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) * demo.NOISE
+    shift = 2 * np.pi * am.OFFSET / am.FS
+    for t, payload, amp in packets:
+        z = np.conj(np.array(phy.modulate(phy.encode_symbols(payload), am.FS)))
+        i = int(t * am.FS)
+        x[i:i + len(z)] += amp * z * np.exp(1j * shift * (i + np.arange(len(z))))
+    iq = np.empty(2 * n, np.int8)
+    iq[0::2] = np.clip(np.round(x.real * 128), -127, 127)
+    iq[1::2] = np.clip(np.round(x.imag * 128), -127, 127)
+    rx, out = am.Receiver(), []
+    data = iq.tobytes()
+    for i in range(0, len(data) - 2 * am.BLOCK + 1, 2 * am.BLOCK):
+        out += rx.process(data[i:i + 2 * am.BLOCK])["packets"]
+    return [p for p in out if p["kind"] != "other"]
+
+
+def data_packet(seq, length):
+    """A v0.1 data packet: 0xA4, 16-bit counter, then data."""
+    return bytes([0xA4, seq & 255, seq >> 8]) + bytes((7 * i + seq) & 255 for i in range(length - 3))
+
+
+WEAK, STRONG = 0.02, 0.12                     # amplitudes: found by preamble (SNR ~7 dB) / by energy (~18 dB)
+
+
+class LongPackets(unittest.TestCase):
+    """Data packets of 140-199 bytes (seen from the v0.1 nodes on 26-11-2026) and the longest LoRa allows."""
+
+    def test_weak_long_packets(self):            # a weak packet's end can't be seen: it needs a long enough window
+        sent = [(0.05 + 0.1 * k, data_packet(k, 199), WEAK) for k in range(4)]
+        got = capture(sent, 0.6)
+        self.assertEqual([p["data"] for p in got if p["kind"] == "ok"], [d for _, d, _ in sent])
+
+    def test_longest_packet(self):
+        sent = [(0.05 + 0.1 * k, data_packet(k, 255), a) for k, a in enumerate((STRONG, WEAK))]
+        got = capture(sent, 0.4)
+        self.assertEqual([p["data"] for p in got if p["kind"] == "ok"], [d for _, d, _ in sent])
+
+    def test_beacon_right_after_a_weak_data_packet(self):     # the nodes send a beacon ~40 ms after data
+        sent = []
+        for k in range(3):
+            t = 0.05 + 0.15 * k
+            sent += [(t, data_packet(2 * k, 150), WEAK), (t + 0.040, bytes([0xA5, 2 * k + 1, 0]), WEAK)]
+        got = capture(sent, 0.6)
+        self.assertEqual([p["data"] for p in got if p["kind"] == "ok"], [d for _, d, _ in sent])
+
+
 class OtherRadioSettings(unittest.TestCase):
     """The demo made and decoded at other settings (air-monitor.toml): every LoRa packet of the first loop."""
 

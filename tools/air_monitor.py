@@ -55,7 +55,7 @@ THR_DB = 10.0                        # energy threshold above the noise floor (b
 END_DB = 4.0                         # a strong burst ends after 4 blocks below this (hysteresis)
 PRE_RATIO = 4.5                      # dechirped peak / mean magnitude for a preamble block (noise is ~2.5)
 PRE_RUN = 4                          # consecutive preamble blocks to trigger on a weak packet
-WEAK_LEN = 120                       # blocks decoded after a weak (below-threshold) preamble (~9.5 ms)
+WEAK_LEN = 120                       # blocks a weak (below-threshold) burst counts as busy (~9.5 ms)
 WORKERS = min(4, os.cpu_count() or 1)   # threads for the FFTs
 LOGS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 
@@ -65,10 +65,21 @@ CUTOFF = 0.95e6                           # channel filter cut-off
 RADIO = radio_config.DEFAULT              # the settings above, as radio_config.Radio
 
 
+def _packet_lengths():
+    """(payload symbols of the longest LoRa packet, 255 bytes; blocks to keep after a weak preamble to decode it).
+    A weak packet's end can't be seen, so it is decoded from a window that fits the longest one."""
+    max_symbols = len(phy.encode_symbols(bytes(255)))
+    return max_symbols, int(phy.PREAMBLE + 4.25) + 1 + max_symbols + 4
+
+
+MAX_SYMBOLS, WEAK_SPAN = _packet_lengths()   # 378 and 399 at SF7, CR 4/5
+
+
 def configure(radio):
     """Use other radio settings (radio_config.Radio). The defaults are the values above. Call before making a
     Receiver; every process calls it (the window, and the receiver process via Worker)."""
-    global RADIO, CH, FS, OS, OFFSET, FC, N, BW, BLOCK, HZ_PER_BIN, HIST_BLOCKS, DOWN, UP, CUTOFF
+    global RADIO, CH, FS, OS, OFFSET, FC, N, BW, BLOCK, HZ_PER_BIN, HIST_BLOCKS, DOWN, UP, CUTOFF, \
+        MAX_SYMBOLS, WEAK_SPAN
     phy.configure(radio.sf, radio.bw, radio.cr - 4)
     RADIO, CH, BW, N = radio, radio.freq_hz, phy.BW, phy.N
     OS, FS, OFFSET, CUTOFF, BLOCK = radio.os, radio.fs, radio.offset, radio.cutoff, radio.block
@@ -77,6 +88,7 @@ def configure(radio):
     HIST_BLOCKS = int(2.5 * BW / N)
     DOWN = np.array(phy.DOWN, np.complex64)
     UP = np.conj(DOWN)
+    MAX_SYMBOLS, WEAK_SPAN = _packet_lengths()
 
 
 # --------------------------------------------------------------------------------------------- LoRa DSP
@@ -154,7 +166,7 @@ def decode_symbols(x, start):
 
     sync = tuple(syms_at([ks, ks + N]))
     pay = ks + sfd
-    count = min(300, (len(x) - pay) // N)
+    count = min(MAX_SYMBOLS + 8, (len(x) - pay) // N)                  # up to the longest packet
     syms = syms_at(pay + N * np.arange(count)) if count > 0 else []
     # Frequency error: an upchirp's dechirped peak moves with (CFO - timing), a downchirp's with (CFO + timing).
     down = fpeaks(x, [ks + 2 * N], UP)[0][0]
@@ -283,7 +295,8 @@ class Receiver:
         packets, keep = [], []
         for bu in self.pending:
             s_chip = (bu["start"] - 4) * N
-            e_chip = (max(bu["end"], bu["start"] + WEAK_LEN) + 24) * N      # room for the longest packet
+            # room for the packet: a strong burst's end is measured; a weak one gets room for the longest packet
+            e_chip = (max(bu["end"], bu["start"] + (WEAK_LEN if bu["strong"] else WEAK_SPAN)) + 24) * N
             if e_chip > end:
                 keep.append(bu)
                 continue

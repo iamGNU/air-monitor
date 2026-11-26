@@ -8,9 +8,16 @@ import payloads as pl  # noqa: E402
 
 class Describe(unittest.TestCase):
     def test_counter(self):
-        d = pl.describe(bytes.fromhex("a5d708"))                       # seen on the bench
-        self.assertEqual((d.shown, d.seq, d.stream, d.style), ("Packet #2263", 0x08D7, 0xA5, "counter"))
+        d = pl.describe(bytes.fromhex("a5d708"))                       # seen on the bench: a beacon
+        self.assertEqual((d.shown, d.seq, d.style), ("Packet #2263", 0x08D7, "counter"))
         self.assertEqual(pl.describe(bytes.fromhex("a5ffff")).seq, 65535)
+
+    def test_data_packets_share_the_counter(self):
+        # 26-11-2026: a5 c6 02 (#710), then a 140-byte a4 c7 02 ... (#711), then a5 c8 02 (#712)
+        beacon, data = pl.describe(bytes.fromhex("a5c602")), pl.describe(bytes.fromhex("a4c702fd1c0000b0") + bytes(132))
+        self.assertEqual((data.shown, data.seq, data.style), ("Packet #711 · 137 bytes", 711, "counter"))
+        self.assertEqual(data.stream, beacon.stream)                    # one counter for both types
+        self.assertEqual(pl.describe(bytes.fromhex("a5ce02180000ba")).shown, "Packet #718 · 4 bytes")
 
     def test_text(self):
         self.assertEqual(pl.describe(b"node-1 temp 21.5 C  ")[::3], ("node-1 temp 21.5 C", "text"))
@@ -18,7 +25,7 @@ class Describe(unittest.TestCase):
 
     def test_hex(self):
         self.assertEqual(pl.describe(bytes.fromhex("b5d708"))[::3], ("b5 d7 08", "hex"))   # other first byte
-        self.assertEqual(pl.describe(bytes.fromhex("a5d70800"))[::3], ("a5 d7 08 00", "hex"))  # other length
+        self.assertEqual(pl.describe(bytes.fromhex("a5d7"))[::3], ("a5 d7", "hex"))            # too short
         self.assertEqual(pl.describe(b"\0\0").shown, "00 00")
 
 
@@ -26,8 +33,17 @@ class Tracker(unittest.TestCase):
     def feed(self, events):
         t = pl.SequenceTracker()
         for e in events:
-            t.bad() if e == "bad" else t.good(0xA5, e)
+            t.bad() if e == "bad" else t.good("v0.1", e)
         return t
+
+    def test_bench_2026_11_26(self):
+        # beacons and data packets interleaved on one counter: nothing is lost
+        t = pl.SequenceTracker()
+        for payload in ["a5c402", "a5c502", "a5c602", "a4c702fd1c", "a5c802", "a5c902", "a5ca02", "a5cb02",
+                        "a5cc02", "a4cd02fd09", "a5ce021800", "a5cf02"]:
+            d = pl.describe(bytes.fromhex(payload))
+            t.good(d.stream, d.seq)
+        self.assertEqual((t.received, t.lost), (12, 0))
 
     def test_no_loss(self):
         t = self.feed([10, 11, 12, 13])
@@ -58,7 +74,7 @@ class Tracker(unittest.TestCase):
     def test_new_run_forgets_the_gap(self):
         t = self.feed([10, 11])
         t.new_run()                                                     # sensitivity change: ~1 s not listening
-        t.good(0xA5, 21)
+        t.good("v0.1", 21)
         self.assertEqual((t.received, t.lost), (3, 0))
 
     def test_streams_are_separate(self):
